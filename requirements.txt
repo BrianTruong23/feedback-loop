@@ -1,0 +1,9 @@
+mujoco==3.3.7
+robosuite
+torch
+torchvision
+transformers
+opencv-python
+Pillow
+numpy
+matplotlib
