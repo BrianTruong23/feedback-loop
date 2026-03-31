@@ -3,6 +3,9 @@ import numpy as np
 import torch
 from transformers import OwlViTProcessor, OwlViTForObjectDetection
 import time
+import os
+import platform
+import sys
 
 def run_baseline(instruction="pick the milk"):
     print(f"--- Starting Baseline Task ---")
@@ -16,13 +19,18 @@ def run_baseline(instruction="pick the milk"):
 
     # 2. Environment Setup
     print("Initializing Robosuite 'PickPlace' environment with Panda arm...")
+    render_enabled = os.environ.get("BASELINE_RENDER", "0") == "1"
+    if platform.system() == "Darwin" and render_enabled and "mjpython" not in os.path.basename(sys.executable):
+        print("Rendering requested, but macOS MuJoCo requires mjpython. Falling back to headless mode.")
+        render_enabled = False
+
     # The default PickPlaceSingle loads a Single Object, PickPlace loads 4 (Milk, Bread, Cereal, Can)
     # We will use PickPlace to have clutter.
     env = suite.make(
         env_name="PickPlace", 
         robots="Panda",             
-        controller_configs=suite.load_controller_config(default_controller="OSC_POSE"), 
-        has_renderer=True,         # Show the window!
+        controller_configs=suite.load_composite_controller_config(controller="BASIC"),
+        has_renderer=render_enabled,
         use_camera_obs=False,      # Set to False to speed up simulation loops if not reading camera directly
         has_offscreen_renderer=False,
         control_freq=20,
@@ -31,7 +39,8 @@ def run_baseline(instruction="pick the milk"):
 
     # 3. Task Execution
     obs = env.reset()
-    env.render()
+    if render_enabled:
+        env.render()
     
     # Simulate VLM picking out the target from the language instruction
     target_obj_name = None
@@ -66,19 +75,20 @@ def run_baseline(instruction="pick the milk"):
 
     # Grasp Heuristic
     # Move above -> Move down -> Close Gripper -> Move up
-    def step_towards(target_xyz, gripper_action, steps=40):
+    def step_towards(current_obs, target_xyz, gripper_action, steps=40):
         for _ in range(steps):
-            current_eef = obs['robot0_eef_pos']
+            current_eef = current_obs['robot0_eef_pos']
             delta = target_xyz - current_eef
             # Action space for OSC_POSE is [dx, dy, dz, dax, day, daz, gripper]
             # scaled to max velocity
             action = np.zeros(7)
             action[:3] = delta * 5.0 
             action[6] = gripper_action
-            obs, reward, done, info = env.step(action)
-            env.render()
+            current_obs, reward, done, info = env.step(action)
+            if render_enabled:
+                env.render()
             time.sleep(0.01) # slow down so user can see it
-        return obs
+        return current_obs
         
     # Get initial object position. 
     # The sim ID is usually obj.name + "_body" or we can get it from sim data.
@@ -89,23 +99,23 @@ def run_baseline(instruction="pick the milk"):
     print("Action Plan: Hovering above object...")
     hover_pos = obj_pos.copy()
     hover_pos[2] += 0.2
-    obs = step_towards(hover_pos, gripper_action=-1) # Open gripper (-1)
+    obs = step_towards(obs, hover_pos, gripper_action=-1) # Open gripper (-1)
     
     # Move down to object
     print("Action Plan: Lowering to grasp...")
     grasp_pos = obj_pos.copy()
     grasp_pos[2] += 0.02 # Slightly above center 
-    obs = step_towards(grasp_pos, gripper_action=-1, steps=30)
+    obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=30)
     
     # Close gripper
     print("Action Plan: Closing gripper...")
-    obs = step_towards(grasp_pos, gripper_action=1, steps=20) # Close gripper (1)
+    obs = step_towards(obs, grasp_pos, gripper_action=1, steps=20) # Close gripper (1)
     
     # Lift object
     print("Action Plan: Lifting...")
     lift_pos = grasp_pos.copy()
     lift_pos[2] += 0.3
-    obs = step_towards(lift_pos, gripper_action=1, steps=50)
+    obs = step_towards(obs, lift_pos, gripper_action=1, steps=50)
     
     # Check outcome
     final_pos = env.sim.data.body_xpos[body_id]
