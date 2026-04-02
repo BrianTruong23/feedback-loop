@@ -198,7 +198,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     # Move down to object
     print("Action Plan: Lowering to grasp...")
     grasp_pos = obj_pos.copy()
-    grasp_pos[2] += 0.02 # Slightly above center 
+    grasp_pos[2] -= 0.06 # Plunge gripper downwards to envelop the object
     obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=30)
     
     # Close gripper
@@ -331,7 +331,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                             
                             print("Retry Action Plan: Lowering...")
                             grasp_pos = obj_pos.copy()
-                            grasp_pos[2] += 0.02
+                            grasp_pos[2] -= 0.06 # Plunge gripper downwards to envelop the target pixel height
                             obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=30)
                             
                             print("Retry Action Plan: Grasping...")
