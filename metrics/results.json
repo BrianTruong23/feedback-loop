@@ -1,0 +1,50 @@
+[
+    {
+        "task_success": false,
+        "wrong_object": false,
+        "grasp_success": false,
+        "recovery_success": false,
+        "attempts": 1,
+        "latency": 6.9532880783081055,
+        "failure_type": "",
+        "explanation": "",
+        "condition": "baseline",
+        "trial": 0
+    },
+    {
+        "task_success": false,
+        "wrong_object": false,
+        "grasp_success": false,
+        "recovery_success": false,
+        "attempts": 1,
+        "latency": 3.341278314590454,
+        "failure_type": "",
+        "explanation": "",
+        "condition": "baseline",
+        "trial": 1
+    },
+    {
+        "task_success": false,
+        "wrong_object": false,
+        "grasp_success": false,
+        "recovery_success": false,
+        "attempts": 2,
+        "latency": 10.546147108078003,
+        "failure_type": "no object reached",
+        "explanation": "The robot attempted to grasp the 'Milk' but completely missed the object and did not make contact with it.",
+        "condition": "feedback",
+        "trial": 0
+    },
+    {
+        "task_success": false,
+        "wrong_object": false,
+        "grasp_success": false,
+        "recovery_success": false,
+        "attempts": 2,
+        "latency": 15.904898881912231,
+        "failure_type": "no object reached",
+        "explanation": "The robot attempted to grasp the 'Milk' but completely missed the target object. In the AFTER image, the milk appears untouched in its original position.",
+        "condition": "feedback",
+        "trial": 1
+    }
+]
