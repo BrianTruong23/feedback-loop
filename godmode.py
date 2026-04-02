@@ -6,8 +6,6 @@ import time
 import os
 import platform
 import sys
-from PIL import Image
-from robosuite.utils.camera_utils import get_camera_transform_matrix, get_real_depth_map, transform_from_pixels_to_world
 
 def run_baseline(instruction="pick the milk"):
     print(f"--- Starting Baseline Task ---")
@@ -33,12 +31,8 @@ def run_baseline(instruction="pick the milk"):
         robots="Panda",             
         controller_configs=suite.load_composite_controller_config(controller="BASIC"),
         has_renderer=render_enabled,
-        use_camera_obs=True,      # Enabled for OWL-ViT vision
-        camera_names="frontview",
-        camera_heights=256,
-        camera_widths=256,
-        camera_depths=True,
-        has_offscreen_renderer=True, # Need offscreen to render camera obs
+        use_camera_obs=False,      # Set to False to speed up simulation loops if not reading camera directly
+        has_offscreen_renderer=False,
         control_freq=20,
         render_camera="frontview",
     )
@@ -62,47 +56,22 @@ def run_baseline(instruction="pick the milk"):
         
     print(f"Perception matched object: {target_obj_name}")
 
-    # Process camera obs and detect with OWL-ViT
-    img = obs["frontview_image"][::-1] # robosuite is upside down vertically
-    depth = obs["frontview_depth"]
-    
-    texts = [[f"a photo of a {target_obj_name.lower()}"]]
-    inputs = processor(text=texts, images=img, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    target_sizes = torch.tensor([img.shape[:2]]).to(device)
-    # Deprecation warning fix: using post_process_grounded_object_detection
-    results = processor.post_process_grounded_object_detection(outputs=outputs, target_sizes=target_sizes, text_labels=texts, threshold=0.01)
-    
-    if len(results[0]["scores"]) == 0:
+    # Fetch ground-truth pos (mimicking a PERFECT 2D->3D mapping from the VLM)
+    try:
+        # Robosuite adds suffix _body to object names in the physics tree sometimes
+        # Specifically for PickPlace, the bodies are named "Milk_body", etc.
+        body_name = target_obj_name + "_visual" # just checking existence
+    except:
+        pass
+
+    # Actually in Robosuite, we can loop through the objects in the environment
+    # env.objects is a list of object classes.
+    obj = next((o for o in env.objects if target_obj_name.lower() in o.name.lower()), None)
+    if not obj:
         print("Failure Reasoning: 'target occluded' / not found")
-        print("Explanation: OWL-ViT could not visually detect the object in the camera view.")
         return False
         
-    # Get the highest scoring box
-    best_idx = torch.argmax(results[0]["scores"])
-    box = results[0]["boxes"][best_idx].cpu().numpy()
-    score = results[0]["scores"][best_idx].cpu().numpy()
-    
-    print(f"OWL-ViT Detected '{target_obj_name}' with score {score:.3f}")
-    
-    # Calculate pixel center
-    u = (box[0] + box[2]) / 2.0
-    v = (box[1] + box[3]) / 2.0
-    
-    # Original image coordinate matching for depth map
-    orig_v = 256 - v
-    
-    # Project 2D to 3D using real depth map
-    real_depth = get_real_depth_map(env.sim, depth)
-    cam_mat = get_camera_transform_matrix(env.sim, "frontview", 256, 256)
-    pixels = np.array([[u, orig_v]])
-    real_depth_img = np.expand_dims(real_depth, axis=-1)
-    
-    pt_3d = transform_from_pixels_to_world(pixels, [real_depth_img], cam_mat)[0]
-    
-    print(f"Targeting '{target_obj_name}' at 3D coordinate {pt_3d}...")
+    print(f"Targeting '{obj.name}'...")
 
     # Grasp Heuristic
     # Move above -> Move down -> Close Gripper -> Move up
@@ -121,10 +90,10 @@ def run_baseline(instruction="pick the milk"):
                 time.sleep(0.05) # slow down so user can see it smoothly
         return current_obs
         
-        return current_obs
-        
-    # VLM Target 3D Position
-    obj_pos = pt_3d.copy()
+    # Get initial object position. 
+    # The sim ID is usually obj.name + "_body" or we can get it from sim data.
+    body_id = env.sim.model.body_name2id(obj.root_body)
+    obj_pos = env.sim.data.body_xpos[body_id].copy()
 
     # Move above object
     print("Action Plan: Hovering above object...")
@@ -149,20 +118,16 @@ def run_baseline(instruction="pick the milk"):
     obs = step_towards(obs, lift_pos, gripper_action=1, steps=50)
     
     # Check outcome
-    # Check outcome (we still use god-mode ID specifically to evaluate *success*, not for grasping)
-    obj = next((o for o in env.objects if target_obj_name.lower() in o.name.lower()), None)
-    if obj:
-        body_id = env.sim.model.body_name2id(obj.root_body)
-        final_pos = env.sim.data.body_xpos[body_id]
-        
-        if final_pos[2] > 0.85: # roughly table height
-            print("\nOutcome: SUCCESS")
-            print("The baseline policy successfully completed the language instruction.")
-        else:
-            print("\nOutcome: FAILURE")
-            print("Failure Reasoning: 'grasp instability'")
-            print("Explanation: Evaluator detected that the object slipped or was not successfully lifted above the table height.")
-            # This is where the feedback loop in week 2 will kick in!
+    final_pos = env.sim.data.body_xpos[body_id]
+    
+    if final_pos[2] > 0.85: # roughly table height
+        print("\nOutcome: SUCCESS")
+        print("The baseline policy successfully completed the language instruction.")
+    else:
+        print("\nOutcome: FAILURE")
+        print("Failure Reasoning: 'grasp instability'")
+        print("Explanation: Evaluator detected that the object slipped or was not successfully lifted above the table height.")
+        # This is where the feedback loop in week 2 will kick in!
         
     env.close()
 
