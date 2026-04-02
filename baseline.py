@@ -160,8 +160,11 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     
     # Project 2D to 3D using real depth map
     real_depth = get_real_depth_map(env.sim, depth)
-    cam_mat = get_camera_transform_matrix(env.sim, "frontview", 256, 256)
-    pixels = np.array([u, orig_v])
+    cam_mat = np.linalg.inv(get_camera_transform_matrix(env.sim, "frontview", 256, 256))
+    
+    # transform_from_pixels_to_world inherently expects [row, col] format (i.e. [v, u])
+    # so that bilinear interpolation correctly maps im[v, u] and cam_pts traces u*z, v*z.
+    pixels = np.array([orig_v, u])
     
     pt_3d = transform_from_pixels_to_world(pixels, real_depth, cam_mat)
     
@@ -176,13 +179,11 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             # Action space for OSC_POSE is [dx, dy, dz, dax, day, daz, gripper]
             # scaled to max velocity
             action = np.zeros(7)
-            action[:3] = delta * 5.0 
+            action[:3] = np.clip(delta * 5.0, -1.0, 1.0)
             action[6] = gripper_action
             current_obs, reward, done, info = env.step(action)
             if render_enabled and video_writer:
                 video_writer.append_data(current_obs["frontview_image"][::-1])
-        return current_obs
-        
         return current_obs
         
     # VLM Target 3D Position
@@ -270,6 +271,10 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                                 pos_info = {"robot_x": eef_pos[0], "robot_y": eef_pos[1], "robot_z": eef_pos[2]}
                                 with open(os.path.join(run_dir, f"robot_position_failure_{retry_idx+1}.json"), "w") as f:
                                     json.dump(pos_info, f, indent=2)
+                                    
+                                # Export the target object explicitly
+                                with open(os.path.join(run_dir, "target_object.txt"), "w") as f:
+                                    f.write(f"Target Object: {target_obj_name}\n")
                             except Exception: pass
                             
                         metrics["failure_type"] = explanation_json.get("failure_type", "")
@@ -309,8 +314,10 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                             orig_v_new = 255 - v_new
                             
                             real_depth_after = get_real_depth_map(env.sim, after_depth)
-                            cam_mat_after = get_camera_transform_matrix(env.sim, "frontview", 256, 256)
-                            pixels_new = np.array([u_new, orig_v_new])
+                            cam_mat_after = np.linalg.inv(get_camera_transform_matrix(env.sim, "frontview", 256, 256))
+                            
+                            # Inherently transposed to [row, col] format
+                            pixels_new = np.array([orig_v_new, u_new])
                             
                             pt_3d_new = transform_from_pixels_to_world(pixels_new, real_depth_after, cam_mat_after)
                             print(f"Targeting '{target_obj_name}' at NEW 3D coordinate {pt_3d_new}...")
