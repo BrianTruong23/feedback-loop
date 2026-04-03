@@ -2,13 +2,18 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import sys
 import seaborn as sns
+
+# Ensure cwd is project root so metrics/ paths resolve correctly
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+os.chdir(PROJECT_ROOT)
 
 def plot_metrics():
     with open("metrics/results.json", "r") as f:
         results = json.load(f)
         
-    conditions = ["baseline", "explanation_only", "feedback", "feedback_double"]
+    conditions = ["baseline", "explanation_only", "feedback", "feedback_double", "feedback_6"]
     
     # Calculate rates
     metrics = {cond: {"task_success": 0, "wrong_object": 0, "grasp_success": 0, "recovery_success": 0, "attempts": [], "latency": []} for cond in conditions}
@@ -35,21 +40,24 @@ def plot_metrics():
         
     # --- Plotting 1: Success Rates ---
     labels = ['Task Success', 'Wrong-Object Selection', 'Grasp Success', 'Recovery Success']
-    
     bar_width = 0.2
     x = np.arange(len(labels))
     
     plt.figure(figsize=(10, 6))
     
-    c1_vals = [rates["baseline"]["task_success"], rates["baseline"]["wrong_object"], rates["baseline"]["grasp_success"], rates["baseline"]["recovery_success"]]
-    c2_vals = [rates["explanation_only"]["task_success"], rates["explanation_only"]["wrong_object"], rates["explanation_only"]["grasp_success"], rates["explanation_only"]["recovery_success"]]
-    c3_vals = [rates["feedback"]["task_success"], rates["feedback"]["wrong_object"], rates["feedback"]["grasp_success"], rates["feedback"]["recovery_success"]]
-    c4_vals = [rates["feedback_double"]["task_success"], rates["feedback_double"]["wrong_object"], rates["feedback_double"]["grasp_success"], rates["feedback_double"]["recovery_success"]]
+    colors = {
+        "baseline": 'lightskyblue',
+        "explanation_only": 'salmon',
+        "feedback": 'mediumseagreen',
+        "feedback_double": 'gold'
+    }
     
-    plt.bar(x - 1.5*bar_width, c1_vals, bar_width, label='Baseline', color='lightskyblue')
-    plt.bar(x - 0.5*bar_width, c2_vals, bar_width, label='Explanation Only', color='salmon')
-    plt.bar(x + 0.5*bar_width, c3_vals, bar_width, label='Explanation + Feedback', color='mediumseagreen')
-    plt.bar(x + 1.5*bar_width, c4_vals, bar_width, label='Explanation + Double Feedback', color='gold')
+    offset = -1.5
+    for cond in conditions:
+        if counts[cond] > 0:
+            vals = [rates[cond]["task_success"], rates[cond]["wrong_object"], rates[cond]["grasp_success"], rates[cond]["recovery_success"]]
+            plt.bar(x + offset * bar_width, vals, bar_width, label=cond.replace('_', ' ').capitalize(), color=colors.get(cond, 'gray'))
+            offset += 1
     
     plt.ylabel('Rate (%)')
     plt.title('Experimental Outcome Rates by Condition')
