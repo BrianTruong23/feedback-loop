@@ -1,0 +1,13 @@
+[robosuite WARNING] No private macro file found! (macros.py:57)
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:58)
+[robosuite WARNING] To setup, run: python /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/scripts/setup_macros.py (macros.py:59)
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+[robosuite INFO] Loading controller configuration from: /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/controllers/config/robots/default_panda.json (composite_controller_factory.py:121)
+[robosuite INFO] Loading controller configuration from: /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/controllers/config/robots/default_panda.json (composite_controller_factory.py:121)
+WARNING! gymnasium is not installed. We will try to use openai gym instead.
+Warning: make sure gym is installed if you want to use the GymWrapper.
+Robot eef pos: [-0.04936577 -0.09983589  0.99787457]
+pt 3D with orig_v (Flawed): [-3.93020717e-01  4.57860737e-16  9.24300781e-01]
+pt 3D with v + flipped_depth (Fix): [-3.91298679e-01  4.62034595e-16  9.17856852e-01]
+pt 3D lower on image (v=200): [-4.80707385e-01  8.40021499e-16  3.40059462e-01]

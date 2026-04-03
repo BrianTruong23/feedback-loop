@@ -1,0 +1,17 @@
+[robosuite WARNING] No private macro file found! (macros.py:57)
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:58)
+[robosuite WARNING] To setup, run: python /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/scripts/setup_macros.py (macros.py:59)
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+[robosuite INFO] Loading controller configuration from: /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/controllers/config/robots/default_panda.json (composite_controller_factory.py:121)
+[robosuite INFO] Loading controller configuration from: /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/controllers/config/robots/default_panda.json (composite_controller_factory.py:121)
+WARNING! gymnasium is not installed. We will try to use openai gym instead.
+Warning: make sure gym is installed if you want to use the GymWrapper.
+Projected pixel [v, u]: [176 138]
+Depth value at v,u: [3.567484]
+Traceback (most recent call last):
+  File "/Users/tht0021/Documents/robotics-project/test_identity.py", line 30, in <module>
+    world_pt_recovered = transform_from_pixels_to_world(np.array([pixel]), depth, cam_mat_inv)
+  File "/Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/utils/camera_utils.py", line 193, in transform_from_pixels_to_world
+    assert depth_map_leading_shape == pixels_leading_shape
+AssertionError

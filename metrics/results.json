@@ -5,7 +5,7 @@
         "grasp_success": false,
         "recovery_success": false,
         "attempts": 1,
-        "latency": 7.013300895690918,
+        "latency": 7.193940877914429,
         "failure_type": "",
         "explanation": "",
         "condition": "baseline",
@@ -17,9 +17,9 @@
         "grasp_success": false,
         "recovery_success": false,
         "attempts": 2,
-        "latency": 12.189726829528809,
+        "latency": 21.682679176330566,
         "failure_type": "no object reached",
-        "explanation": "The robot attempted to grasp the milk, but its gripper closed without contacting the object. The milk remained in its original position.",
+        "explanation": "The robot attempted to grasp the milk carton but missed it completely, failing to make contact with the object.",
         "condition": "feedback",
         "trial": 0
     }

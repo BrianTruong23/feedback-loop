@@ -198,7 +198,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     # Move down to object
     print("Action Plan: Lowering to grasp...")
     grasp_pos = obj_pos.copy()
-    grasp_pos[2] -= 0.06 # Plunge gripper downwards to envelop the object
+    grasp_pos[2] = 0.825 # Force gripper deep down to exact table grasping level to guarantee enveloping
     obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=30)
     
     # Close gripper
@@ -330,9 +330,9 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                             obs = step_towards(obs, hover_pos, gripper_action=-1)
                             
                             print("Retry Action Plan: Lowering...")
-                            grasp_pos = obj_pos.copy()
-                            grasp_pos[2] -= 0.06 # Plunge gripper downwards to envelop the target pixel height
-                            obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=30)
+                            grasp_pos = pt_3d_new.copy()
+                            grasp_pos[2] = 0.825 # Force gripper deep down to exact table grasping level
+                            obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=40)
                             
                             print("Retry Action Plan: Grasping...")
                             obs = step_towards(obs, grasp_pos, gripper_action=1, steps=20)

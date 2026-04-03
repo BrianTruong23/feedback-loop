@@ -1,0 +1,18 @@
+[robosuite WARNING] No private macro file found! (macros.py:57)
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:58)
+[robosuite WARNING] To setup, run: python /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/scripts/setup_macros.py (macros.py:59)
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+[robosuite INFO] Loading controller configuration from: /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/controllers/config/robots/default_panda.json (composite_controller_factory.py:121)
+[robosuite INFO] Loading controller configuration from: /Users/tht0021/Documents/robotics-project/venv/lib/python3.9/site-packages/robosuite/controllers/config/robots/default_panda.json (composite_controller_factory.py:121)
+--- GOD MODE OBJECT POSITIONS ---
+VisualMilk: [0.0025 0.1575 0.885 ]
+VisualBread: [0.1975 0.1575 0.845 ]
+VisualCereal: [0.0025 0.4025 0.9   ]
+VisualCan: [0.1975 0.4025 0.86  ]
+Milk: [ 0.07043845 -0.26025127  0.885     ]
+Bread: [ 0.03373634 -0.13643611  0.845     ]
+Cereal: [ 0.18523835 -0.19188226  0.9       ]
+Can: [ 0.13765758 -0.36359885  0.86      ]
+--- ROBOT EEF ---
+EEF Pos: [-0.03554139 -0.1061946   1.0104932 ]
