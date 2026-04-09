@@ -20,10 +20,17 @@ MAX_YAW_ACTION = 0.18
 YAW_TOL = np.deg2rad(1.5)
 DEFAULT_GRIPPER_YAW_DEG = -45.0
 OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
-SLIP_RECOVERY_Z_OFFSET_M = -0.22
+# Slip recovery depth is a tradeoff:
+# more negative makes the retry descend deeper, which can improve enclosure,
+# but if it is too low the gripper tends to hit or knock over the cereal box
+# and the policy stops making useful progress. If it is not negative enough,
+# the grasp stays too shallow and the box often slips during lift.
+SLIP_RECOVERY_Z_OFFSET_M = -0.2
+
 SLIP_RECOVERY_SETTLE_STEPS = 16
-GRASP_HOVER_Z_OFFSET_M = 0.14
+GRASP_HOVER_Z_OFFSET_M = 0.12
 GRASP_LIFT_Z_OFFSET_M = 0.3
+
 
 def simplify_environment(env):
     """Reposition objects to create a 1-bin / 1-object simplified world (Cereal only)."""
