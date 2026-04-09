@@ -20,6 +20,10 @@ MAX_YAW_ACTION = 0.18
 YAW_TOL = np.deg2rad(1.5)
 DEFAULT_GRIPPER_YAW_DEG = -45.0
 OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
+SLIP_RECOVERY_Z_OFFSET_M = -0.01
+SLIP_RECOVERY_SETTLE_STEPS = 12
+GRASP_HOVER_Z_OFFSET_M = 0.2
+GRASP_LIFT_Z_OFFSET_M = 0.3
 
 def simplify_environment(env):
     """Reposition objects to create a 1-bin / 1-object simplified world (Cereal only)."""
@@ -443,7 +447,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
         print("Action Plan: Hovering above object...")
         hover_pos = target_pos.copy()
-        hover_pos[2] += 0.2
+        hover_pos[2] += GRASP_HOVER_Z_OFFSET_M
         current_obs = step_towards(current_obs, hover_pos, gripper_action=-1, steps=10)
         attempt_frames["pre_hover"] = create_frontview_image(current_obs, env)
 
@@ -464,7 +468,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
         print("Action Plan: Lifting...")
         lift_pos = grasp_pos.copy()
-        lift_pos[2] += 0.3
+        lift_pos[2] += GRASP_LIFT_Z_OFFSET_M
         current_obs = step_towards(current_obs, lift_pos, gripper_action=1, steps=10)
         attempt_frames["post_lift"] = create_frontview_image(current_obs, env)
 
@@ -641,15 +645,15 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
                 elif failure_type == "slip_after_contact":
                     target_pos = obj_pos.copy()
-                    target_pos[2] -= 0.01
+                    target_pos[2] += SLIP_RECOVERY_Z_OFFSET_M
                     recovery_log["policy"] = "lower_grasp_more_settle"
                     recovery_log["parameters"] = {
-                        "z_offset_m": -0.01,
-                        "settle_steps": 12,
+                        "z_offset_m": SLIP_RECOVERY_Z_OFFSET_M,
+                        "settle_steps": SLIP_RECOVERY_SETTLE_STEPS,
                         "target_pos": target_pos.tolist(),
                     }
                     obs, frames, lifted_any, target_ok, wrong_ok = perform_grasp_attempt(
-                        obs, target_pos, settle_steps=12
+                        obs, target_pos, settle_steps=SLIP_RECOVERY_SETTLE_STEPS
                     )
 
                 elif failure_type == "depth_plane_bad":
