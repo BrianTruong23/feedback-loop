@@ -16,7 +16,18 @@ def plot_metrics():
     conditions = ["baseline", "explanation_only", "feedback", "feedback_double", "feedback_6"]
     
     # Calculate rates
-    metrics = {cond: {"task_success": 0, "wrong_object": 0, "grasp_success": 0, "recovery_success": 0, "attempts": [], "latency": []} for cond in conditions}
+    metrics = {
+        cond: {
+            "task_success": 0,
+            "wrong_object": 0,
+            "grasp_success": 0,
+            "recovery_success": 0,
+            "attempts": [],
+            "latency": [],
+            "failed_checkpoints": [],
+        }
+        for cond in conditions
+    }
     counts = {cond: 0 for cond in conditions}
     
     for r in results:
@@ -28,6 +39,9 @@ def plot_metrics():
         if r.get("recovery_success", False): metrics[cond]["recovery_success"] += 1
         metrics[cond]["attempts"].append(r["attempts"])
         metrics[cond]["latency"].append(r["latency"])
+        checkpoint = r.get("failed_checkpoint", "")
+        if checkpoint:
+            metrics[cond]["failed_checkpoints"].append(checkpoint)
         
     rates = {cond: {} for cond in conditions}
     for cond in conditions:
@@ -91,6 +105,26 @@ def plot_metrics():
     plt.tight_layout()
     plt.savefig('metrics/attempts_plot.png')
     plt.close()
+
+    # --- Plotting 4: Failed Checkpoints ---
+    all_failed_checkpoints = []
+    for cond in conditions:
+        all_failed_checkpoints.extend(metrics[cond]["failed_checkpoints"])
+
+    if all_failed_checkpoints:
+        from collections import Counter
+        checkpoint_counts = Counter(all_failed_checkpoints)
+        plt.figure(figsize=(8, 6))
+        plt.pie(
+            checkpoint_counts.values(),
+            labels=checkpoint_counts.keys(),
+            autopct='%1.1f%%',
+            startangle=90,
+        )
+        plt.title('Failed Checkpoint Distribution')
+        plt.tight_layout()
+        plt.savefig('metrics/failed_checkpoints_pie.png')
+        plt.close()
 
     print("Graphs generated in the metrics/ folder.")
 

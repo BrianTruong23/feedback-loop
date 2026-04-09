@@ -7,6 +7,7 @@ import os
 import platform
 import sys
 import datetime
+import re
 from PIL import Image, ImageDraw
 from robosuite.utils.camera_utils import get_camera_transform_matrix, get_real_depth_map, transform_from_pixels_to_world, project_points_from_world_to_camera
 import robosuite.utils.transform_utils as T
@@ -95,6 +96,16 @@ def draw_red_grid_on_array(img_array):
     except:
         return img_array
 
+def get_max_attempts_for_condition(condition):
+    if condition == "feedback":
+        return 2
+    if condition == "feedback_double":
+        return 3
+    match = re.fullmatch(r"feedback_(\d+)", condition or "")
+    if match:
+        return max(1, int(match.group(1)))
+    return 1
+
 def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
     print(f"\n--- Starting Trial {trial_idx} | Condition: {condition} ---")
     print(f"Language Instruction: '{instruction}'")
@@ -108,8 +119,10 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         "attempts": 1,
         "latency": 0.0,
         "failure_type": "",
+        "failed_checkpoint": "",
         "explanation": ""
     }
+    max_attempts = get_max_attempts_for_condition(condition)
     
     if seed is not None:
         np.random.seed(seed)
@@ -169,6 +182,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     POS_TOL = 0.005
     MAX_YAW_ACTION = 0.18
     YAW_TOL = np.deg2rad(1.5)
+    OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
 
     def step_towards(current_obs, target_xyz, gripper_action, steps=10, settle=False):
         target_xyz = np.array(target_xyz, dtype=float)
@@ -214,6 +228,76 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 video_writer.append_data(current_obs["frontview_image"][::-1])
 
         return current_obs
+
+    def score_detection_candidate(box, raw_score, camera_name, previous_target_pos=None):
+        center_u = (box[0] + box[2]) / 2.0
+        center_v = (box[1] + box[3]) / 2.0
+        width = max(1.0, box[2] - box[0])
+        height = max(1.0, box[3] - box[1])
+        area_term = min((width * height) / float(IMG_H * IMG_W), 1.0)
+        score = float(raw_score) + 0.1 * area_term
+        if previous_target_pos is not None:
+            prev_px = project_points_from_world_to_camera(
+                previous_target_pos.reshape(1, 3),
+                get_camera_transform_matrix(env.sim, camera_name, IMG_H, IMG_W),
+                IMG_H,
+                IMG_W,
+            )[0]
+            pixel_dist = np.linalg.norm(np.array([center_v, center_u]) - prev_px)
+            score -= 0.0015 * float(pixel_dist)
+        return score
+
+    def detect_target_pos(current_obs, query, camera_name="frontview", previous_target_pos=None, top_k=3):
+        img_key = f"{camera_name}_image"
+        depth_key = f"{camera_name}_depth"
+        img_raw = current_obs[img_key][::-1]
+        texts_r = [[f"a photo of a {query}"]]
+        inp_r = processor(text=texts_r, images=img_raw, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out_r = model(**inp_r)
+        ts_r = torch.tensor([img_raw.shape[:2]]).to(device)
+        res_r = processor.post_process_grounded_object_detection(
+            outputs=out_r, target_sizes=ts_r, text_labels=texts_r, threshold=0.0
+        )
+        if len(res_r[0]["scores"]) == 0:
+            return None
+
+        boxes = res_r[0]["boxes"].cpu().numpy()
+        scores = res_r[0]["scores"].cpu().numpy()
+        ranked = sorted(
+            [
+                (
+                    score_detection_candidate(
+                        box,
+                        score,
+                        camera_name,
+                        previous_target_pos=previous_target_pos,
+                    ),
+                    float(score),
+                    box,
+                )
+                for box, score in zip(boxes, scores)
+            ],
+            key=lambda item: item[0],
+            reverse=True,
+        )[:top_k]
+
+        best_ranked_score, best_raw_score, best_box = ranked[0]
+        best_u = (best_box[0] + best_box[2]) / 2.0
+        best_v = (best_box[1] + best_box[3]) / 2.0
+        real_depth_local = get_real_depth_map(env.sim, current_obs[depth_key])
+        cam_mat_local = np.linalg.inv(get_camera_transform_matrix(env.sim, camera_name, IMG_H, IMG_W))
+        best_pos = transform_from_pixels_to_world(
+            np.array([(IMG_H - 1) - best_v, best_u]),
+            real_depth_local,
+            cam_mat_local,
+        )
+        best_pos[2] = initial_owlvit_3d[2]
+        print(
+            f"  Re-detection ({camera_name}): chose score={best_raw_score:.3f}, "
+            f"ranked={best_ranked_score:.3f}, center=({best_u:.1f}, {best_v:.1f})"
+        )
+        return best_pos
 
     # 3. Task Execution
     obs = env.reset()
@@ -309,34 +393,6 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
     HOME_POS = np.array([0.4, -0.6, 1.4])
 
-    # Temporal evidence frames captured at each grasp checkpoint for Stage 1 classification
-    frames = {}
-
-    # Move above object
-    print("Action Plan: Hovering above object...")
-    hover_pos = obj_pos.copy()
-    hover_pos[2] += 0.2
-    obs = step_towards(obs, hover_pos, gripper_action=-1, steps=10)
-    frames["pre_hover"] = create_frontview_image(obs, env)
-
-    # Move down to object center
-    print("Action Plan: Lowering to grasp...")
-    grasp_pos = obj_pos.copy()
-    obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=8)
-    frames["contact"] = create_frontview_image(obs, env)
-
-    # Close gripper
-    print("Action Plan: Closing gripper...")
-    obs = step_towards(obs, grasp_pos, gripper_action=1, steps=6, settle=True)
-    frames["post_close"] = create_frontview_image(obs, env)
-
-    # Lift object
-    print("Action Plan: Lifting...")
-    lift_pos = grasp_pos.copy()
-    lift_pos[2] += 0.3
-    obs = step_towards(obs, lift_pos, gripper_action=1, steps=10)
-    frames["post_lift"] = create_frontview_image(obs, env)
-    
     # Check outcome
     # Check outcome helper
     def check_objects_lifted(env_ref, target_name):
@@ -354,8 +410,44 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                     wrong_picked = True
         return lifted_any, target_picked, wrong_picked
 
-    lifted_any, target_picked, wrong_picked = check_objects_lifted(env, target_obj_name)
-    
+    # Temporal evidence frames captured at each grasp checkpoint for Stage 1 classification
+    frames = {}
+
+    def perform_grasp_attempt(current_obs, target_pos, settle_steps=6, pre_yaw_deg=0.0):
+        attempt_frames = {}
+
+        print("Action Plan: Hovering above object...")
+        hover_pos = target_pos.copy()
+        hover_pos[2] += 0.2
+        current_obs = step_towards(current_obs, hover_pos, gripper_action=-1, steps=10)
+        attempt_frames["pre_hover"] = create_frontview_image(current_obs, env)
+
+        if abs(pre_yaw_deg) > 0.5:
+            print(f"Action Plan: Rotating gripper {pre_yaw_deg:.0f}° before descent...")
+            current_obs = rotate_yaw_in_place(
+                current_obs, np.deg2rad(pre_yaw_deg), gripper_action=-1, steps=20
+            )
+
+        print("Action Plan: Lowering to grasp...")
+        grasp_pos = target_pos.copy()
+        current_obs = step_towards(current_obs, grasp_pos, gripper_action=-1, steps=8)
+        attempt_frames["contact"] = create_frontview_image(current_obs, env)
+
+        print("Action Plan: Closing gripper...")
+        current_obs = step_towards(current_obs, grasp_pos, gripper_action=1, steps=settle_steps, settle=True)
+        attempt_frames["post_close"] = create_frontview_image(current_obs, env)
+
+        print("Action Plan: Lifting...")
+        lift_pos = grasp_pos.copy()
+        lift_pos[2] += 0.3
+        current_obs = step_towards(current_obs, lift_pos, gripper_action=1, steps=10)
+        attempt_frames["post_lift"] = create_frontview_image(current_obs, env)
+
+        lifted_any, target_ok, wrong_ok = check_objects_lifted(env, target_obj_name)
+        return current_obs, attempt_frames, lifted_any, target_ok, wrong_ok
+
+    obs, frames, lifted_any, target_picked, wrong_picked = perform_grasp_attempt(obs, obj_pos)
+
     if target_picked:
         print("\nOutcome: SUCCESS")
         print("The baseline policy successfully completed the language instruction.")
@@ -366,42 +458,87 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         if lifted_any:
             metrics["wrong_object"] = True
             metrics["grasp_success"] = True
-            
-        if condition in ["explanation_only", "feedback", "feedback_double", "feedback_6"]:
+
+        feedback_enabled = condition == "explanation_only" or condition.startswith("feedback")
+        if feedback_enabled:
             from src.explanation_module import classify_failure, OPENROUTER_MODEL
+            import json as _json
 
-            # --- Reset: retract arm so scene is unoccluded for the final frame ---
-            print("--- FULL RETRACT: Arm to home for clean scene capture ---")
-            obs = step_towards(obs, HOME_POS, gripper_action=-1, steps=10)
-            frames["retracted"] = create_frontview_image(obs, env)
+            OWLVIT_PROMPTS = {
+                "Milk":   ("milk carton",    "white milk carton with red label"),
+                "Bread":  ("loaf of bread",  "tan rectangular bread loaf box"),
+                "Cereal": ("cereal box",     "red rectangular cereal box"),
+                "Can":    ("soda can",       "red cylindrical metal soda can"),
+            }
 
-            # Always save the 5 evidence frames with numbered names
-            FRAME_ORDER = ["pre_hover", "contact", "post_close", "post_lift", "retracted"]
-            attempt_num = metrics["attempts"]
-            attempt_dir = get_attempt_dir(attempt_num)
-            frames_dir = os.path.join(attempt_dir, "gemini_frames")
-            os.makedirs(frames_dir, exist_ok=True)
-            for i, fname in enumerate(FRAME_ORDER):
-                if fname in frames:
-                    try:
-                        Image.fromarray(frames[fname]).save(
-                            os.path.join(frames_dir, f"frame_{i+1:02d}_{fname}.png")
+            def redetect_target_pos(current_obs, failure_type, disambiguation=False, previous_target_pos=None):
+                """Re-run OWL-ViT from one or more observation views without VLM pixel regression."""
+                base_p, disam_p = OWLVIT_PROMPTS.get(
+                    target_obj_name, (target_obj_name.lower(), target_obj_name.lower())
+                )
+                query = disam_p if disambiguation else base_p
+                if failure_type == "target_occluded":
+                    print("  Occlusion recovery: shifting to a side observation pose and checking birdview first.")
+                    current_obs = step_towards(current_obs, OCCLUSION_OBS_POS, gripper_action=-1, steps=12)
+                    for camera_name in ("birdview", "frontview"):
+                        new_pos = detect_target_pos(
+                            current_obs,
+                            query,
+                            camera_name=camera_name,
+                            previous_target_pos=previous_target_pos,
                         )
-                    except Exception:
-                        pass
+                        if new_pos is not None:
+                            return current_obs, new_pos
+                else:
+                    new_pos = detect_target_pos(
+                        current_obs,
+                        query,
+                        camera_name="frontview",
+                        previous_target_pos=previous_target_pos,
+                    )
+                    if new_pos is not None:
+                        return current_obs, new_pos
 
-            # --- Stage 1: Classify failure from 5 temporal frames ---
-            # VLM reasons over the full grasp sequence; it does NOT provide pixel corrections.
-            print(f"Querying {OPENROUTER_MODEL} for failure classification (5 frames)...")
-            try:
-                failure_result = classify_failure(target_obj_name, frames)
-            except Exception as e:
-                print(f"Failure classification error: {e}")
-                failure_result = None
+                print("  Re-detection: no object found, falling back to initial OWL-ViT target.")
+                return current_obs, initial_owlvit_3d.copy()
 
-            if not failure_result:
-                print("Gemini returned no classification. Ending trial.")
-            else:
+            while not metrics["task_success"]:
+                # --- Reset: retract arm so scene is unoccluded for the final frame ---
+                print("--- FULL RETRACT: Arm to home for clean scene capture ---")
+                obs = step_towards(obs, HOME_POS, gripper_action=-1, steps=10)
+                frames["retracted"] = create_frontview_image(obs, env)
+
+                # Save every frame that is being sent to Gemini for this attempt, including
+                # any auxiliary birdview frames added for debugging or occlusion handling.
+                FRAME_ORDER = ["pre_hover", "contact", "post_close", "post_lift", "retracted"]
+                ordered_frame_names = FRAME_ORDER + sorted(
+                    key for key in frames.keys() if key not in FRAME_ORDER
+                )
+                attempt_num = metrics["attempts"]
+                attempt_dir = get_attempt_dir(attempt_num)
+                frames_dir = os.path.join(attempt_dir, "gemini_frames")
+                os.makedirs(frames_dir, exist_ok=True)
+                for i, fname in enumerate(ordered_frame_names):
+                    if fname in frames:
+                        try:
+                            Image.fromarray(frames[fname]).save(
+                                os.path.join(frames_dir, f"frame_{i+1:02d}_{fname}.png")
+                            )
+                        except Exception:
+                            pass
+
+                # --- Stage 1: Classify failure from 5 temporal frames ---
+                print(f"Querying {OPENROUTER_MODEL} for failure classification (5 frames)...")
+                try:
+                    failure_result = classify_failure(target_obj_name, frames)
+                except Exception as e:
+                    print(f"Failure classification error: {e}")
+                    failure_result = None
+
+                if not failure_result:
+                    print("Gemini returned no classification. Ending trial.")
+                    break
+
                 failure_type = failure_result["failure_type"]
                 failed_checkpoint = failure_result.get("failed_checkpoint", "unknown")
                 print(f"\n[GEMINI FAILURE CLASSIFICATION]")
@@ -411,10 +548,9 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 print(f"  Confidence        : {failure_result['confidence']:.2f}")
 
                 metrics["failure_type"] = failure_type
+                metrics["failed_checkpoint"] = failed_checkpoint
                 metrics["explanation"] = failure_result["explanation"]
 
-                # Save Gemini prompt text and classification result
-                import json as _json
                 try:
                     with open(os.path.join(attempt_dir, "gemini_prompt.txt"), "w") as f:
                         f.write(failure_result.get("prompt_text", ""))
@@ -424,71 +560,16 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 except Exception:
                     pass
 
-                # --- Stage 2: Programmatic recovery policies ---
-                # OWL-ViT remains the primary localizer. VLM only identified the failure type.
-                # Each policy maps to a concrete mechanical action — no pixel regression from VLM.
+                if condition == "explanation_only":
+                    break
 
-                OWLVIT_PROMPTS = {
-                    "Milk":   ("milk carton",    "white milk carton with red label"),
-                    "Bread":  ("loaf of bread",  "tan rectangular bread loaf box"),
-                    "Cereal": ("cereal box",     "red rectangular cereal box"),
-                    "Can":    ("soda can",       "red cylindrical metal soda can"),
-                }
-
-                def do_grasp(current_obs, target_pos, settle_steps=6, pre_yaw_deg=0.0):
-                    """Hover → optional yaw rotation → lower → close gripper → lift."""
-                    hover = target_pos.copy()
-                    hover[2] += 0.2
-                    current_obs = step_towards(current_obs, hover, gripper_action=-1, steps=10)
-                    if abs(pre_yaw_deg) > 0.5:
-                        print(f"  Recovery: rotating gripper {pre_yaw_deg:.0f}° before descent...")
-                        current_obs = rotate_yaw_in_place(
-                            current_obs, np.deg2rad(pre_yaw_deg), gripper_action=-1, steps=20
-                        )
-                    gp = target_pos.copy()
-                    current_obs = step_towards(current_obs, gp, gripper_action=-1, steps=8)
-                    current_obs = step_towards(current_obs, gp, gripper_action=1, steps=settle_steps, settle=True)
-                    lp = gp.copy()
-                    lp[2] += 0.3
-                    current_obs = step_towards(current_obs, lp, gripper_action=1, steps=10)
-                    _, t_ok, w_ok = check_objects_lifted(env, target_obj_name)
-                    return current_obs, t_ok, w_ok
-
-                def redetect_and_grasp(current_obs, disambiguation=False):
-                    """Re-run OWL-ViT from the clean retracted view without VLM pixel regression."""
-                    base_p, disam_p = OWLVIT_PROMPTS.get(
-                        target_obj_name, (target_obj_name.lower(), target_obj_name.lower())
-                    )
-                    query = disam_p if disambiguation else base_p
-                    img_raw = current_obs["frontview_image"][::-1]
-                    texts_r = [[f"a photo of a {query}"]]
-                    inp_r = processor(text=texts_r, images=img_raw, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        out_r = model(**inp_r)
-                    ts_r = torch.tensor([img_raw.shape[:2]]).to(device)
-                    res_r = processor.post_process_grounded_object_detection(
-                        outputs=out_r, target_sizes=ts_r, text_labels=texts_r, threshold=0.0
-                    )
-                    if len(res_r[0]["scores"]) == 0:
-                        print("  Re-detection: no object found, falling back to initial OWL-ViT target.")
-                        return do_grasp(current_obs, initial_owlvit_3d)
-                    bi = torch.argmax(res_r[0]["scores"])
-                    bx = res_r[0]["boxes"][bi].cpu().numpy()
-                    sc = res_r[0]["scores"][bi].cpu().numpy()
-                    print(f"  Re-detection: '{target_obj_name}' score={sc:.3f}")
-                    ru = (bx[0] + bx[2]) / 2.0
-                    rv = (bx[1] + bx[3]) / 2.0
-                    rd = get_real_depth_map(env.sim, current_obs["frontview_depth"])
-                    rcm = np.linalg.inv(get_camera_transform_matrix(env.sim, "frontview", IMG_H, IMG_W))
-                    new_pos = transform_from_pixels_to_world(np.array([(IMG_H - 1) - rv, ru]), rd, rcm)
-                    new_pos[2] = initial_owlvit_3d[2]
-                    print(f"  Re-detected target at {new_pos}")
-                    return do_grasp(current_obs, new_pos)
+                if metrics["attempts"] >= max_attempts:
+                    print(f"Reached max attempt budget ({max_attempts}). Ending trial.")
+                    break
 
                 metrics["attempts"] += 1
                 print(f"\n--- RECOVERY ATTEMPT {metrics['attempts']} | policy={failure_type} ---")
 
-                # Roll video BEFORE the recovery grasp so frames land in the correct file
                 if video_enabled and video_writer is not None:
                     try:
                         video_writer.close()
@@ -507,38 +588,59 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                     "parameters": {},
                     "outcome": None,
                 }
+                target_pos = None
 
                 if failure_type in ("wrong_object", "no_object_reached", "target_occluded"):
                     disambiguation = failure_type == "wrong_object"
+                    obs, target_pos = redetect_target_pos(
+                        obs,
+                        failure_type,
+                        disambiguation=disambiguation,
+                        previous_target_pos=obj_pos.copy(),
+                    )
                     recovery_log["policy"] = "redetect_owlvit"
-                    recovery_log["parameters"] = {"disambiguation": disambiguation}
-                    obs, target_ok, wrong_ok = redetect_and_grasp(obs, disambiguation=disambiguation)
+                    recovery_log["parameters"] = {
+                        "disambiguation": disambiguation,
+                        "target_pos": target_pos.tolist(),
+                    }
+                    obs, frames, lifted_any, target_ok, wrong_ok = perform_grasp_attempt(obs, target_pos)
 
                 elif failure_type in ("grasp_pose_bad", "needs_yaw_adjustment"):
                     yaw = 90.0 if failure_type == "needs_yaw_adjustment" else 45.0
+                    target_pos = obj_pos.copy()
                     recovery_log["policy"] = "yaw_rotation"
-                    recovery_log["parameters"] = {"yaw_deg": yaw, "target_pos": obj_pos.tolist()}
-                    obs, target_ok, wrong_ok = do_grasp(obs, obj_pos, pre_yaw_deg=yaw)
+                    recovery_log["parameters"] = {"yaw_deg": yaw, "target_pos": target_pos.tolist()}
+                    obs, frames, lifted_any, target_ok, wrong_ok = perform_grasp_attempt(
+                        obs, target_pos, pre_yaw_deg=yaw
+                    )
 
                 elif failure_type == "slip_after_contact":
-                    slip_pos = obj_pos.copy()
-                    slip_pos[2] -= 0.01
+                    target_pos = obj_pos.copy()
+                    target_pos[2] -= 0.01
                     recovery_log["policy"] = "lower_grasp_more_settle"
-                    recovery_log["parameters"] = {"z_offset_m": -0.01, "settle_steps": 12,
-                                                   "target_pos": slip_pos.tolist()}
-                    obs, target_ok, wrong_ok = do_grasp(obs, slip_pos, settle_steps=12)
+                    recovery_log["parameters"] = {
+                        "z_offset_m": -0.01,
+                        "settle_steps": 12,
+                        "target_pos": target_pos.tolist(),
+                    }
+                    obs, frames, lifted_any, target_ok, wrong_ok = perform_grasp_attempt(
+                        obs, target_pos, settle_steps=12
+                    )
 
                 elif failure_type == "depth_plane_bad":
-                    adj_pos = obj_pos.copy()
-                    adj_pos[2] -= 0.02
+                    target_pos = obj_pos.copy()
+                    target_pos[2] -= 0.02
                     recovery_log["policy"] = "adjust_depth"
-                    recovery_log["parameters"] = {"z_offset_m": -0.02, "target_pos": adj_pos.tolist()}
-                    obs, target_ok, wrong_ok = do_grasp(obs, adj_pos)
+                    recovery_log["parameters"] = {"z_offset_m": -0.02, "target_pos": target_pos.tolist()}
+                    obs, frames, lifted_any, target_ok, wrong_ok = perform_grasp_attempt(obs, target_pos)
 
                 else:  # abort_unrecoverable
                     print("  Recovery: abort_unrecoverable — no retry possible.")
                     recovery_log["policy"] = "abort"
-                    target_ok, wrong_ok = False, False
+                    lifted_any, target_ok, wrong_ok = False, False, False
+
+                if target_pos is not None:
+                    obj_pos = target_pos.copy()
 
                 if target_ok:
                     print(f"\nOutcome: RECOVERY SUCCESS on Attempt {metrics['attempts']}")
@@ -549,7 +651,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 else:
                     print(f"\nOutcome: RECOVERY FAILURE on Attempt {metrics['attempts']}")
                     recovery_log["outcome"] = "failure"
-                    if wrong_ok:
+                    if wrong_ok or lifted_any:
                         metrics["wrong_object"] = True
                         metrics["grasp_success"] = True
 
@@ -558,6 +660,9 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                         _json.dump(recovery_log, f, indent=2)
                 except Exception:
                     pass
+
+                if target_ok or recovery_log["policy"] == "abort":
+                    break
         
     if video_enabled and video_writer:
         video_writer.close()

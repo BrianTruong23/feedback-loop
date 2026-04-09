@@ -65,6 +65,7 @@ def test_evaluate():
                     "attempts": 1,
                     "latency": 0.0,
                     "failure_type": "runtime_error",
+                    "failed_checkpoint": "runtime_error",
                     "explanation": str(e),
                 }
 
@@ -80,10 +81,13 @@ def test_evaluate():
 
     # Print a quick summary table
     print(f"\n{'='*60}")
-    print(f"{'Condition':<20} {'Success':>8} {'Attempts':>9} {'Latency':>10} {'Failure Type'}")
+    print(f"{'Condition':<20} {'Success':>8} {'Attempts':>9} {'Latency':>10} {'Failure Type':<20} {'Checkpoint'}")
     print(f"{'-'*60}")
     for r in all_results:
-        print(f"{r['condition']:<20} {str(r['task_success']):>8} {r['attempts']:>9} {r['latency']:>9.1f}s  {r.get('failure_type', '')}")
+        print(
+            f"{r['condition']:<20} {str(r['task_success']):>8} {r['attempts']:>9} "
+            f"{r['latency']:>9.1f}s  {r.get('failure_type', ''):<20} {r.get('failed_checkpoint', '')}"
+        )
     print(f"{'='*60}")
 
 

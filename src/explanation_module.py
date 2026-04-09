@@ -100,10 +100,16 @@ Respond with EXACTLY this JSON (no markdown, no extra keys):
 
     frame_order = ["pre_hover", "contact", "post_close", "post_lift", "retracted"]
     frame_labels = ["PRE-HOVER", "CONTACT", "POST-CLOSE", "POST-LIFT", "RETRACTED"]
+    extra_keys = [key for key in frames.keys() if key not in frame_order]
+    ordered_keys = frame_order + sorted(extra_keys)
 
     content = [{"type": "text", "text": prompt}]
-    for i, (key, label) in enumerate(zip(frame_order, frame_labels)):
+    for i, key in enumerate(ordered_keys):
         if key in frames and frames[key] is not None:
+            if key in frame_order:
+                label = frame_labels[frame_order.index(key)]
+            else:
+                label = key.replace("_", " ").upper()
             content.append({"type": "text", "text": f"Frame {i + 1} — {label}:"})
             content.append({"type": "image_url", "image_url": {"url": _encode_image(frames[key])}})
 

@@ -1,11 +1,11 @@
 # VLM-Driven Robotic Feedback Loop & Evaluation Harness
 
-This repository implements an explainable failure reasoning and feedback-driven recovery pipeline for robotic manipulation. It integrates Vision-Language Models (VLMs) to analyze execution failures and provide corrective spatial guidance.
+This repository implements an explainable failure reasoning and feedback-driven recovery pipeline for robotic manipulation. It uses OWL-ViT for open-vocabulary target localization and Gemini 2.5 Flash for temporal failure analysis over grasp-attempt evidence frames.
 
 ## 🚀 Core Objective
-The project aims to transition from a "feed-forward" manipulation pipeline (Detect -> Grasp) to a "closed-loop" feedback system (Detect -> Grasp -> Fail -> Reason -> Recover). 
+The project aims to transition from a "feed-forward" manipulation pipeline (Detect -> Grasp) to a "closed-loop" feedback system (Detect -> Grasp -> Fail -> Reason -> Recover).
 
-By leveraging **Gemini 2.5 Flash (via OpenRouter)**, the robot can understand *why* it missed an object (e.g., "The milk carton was occluded by the robot arm") and receive updated 2D pixel coordinates ($u, v$) to re-attempt the grasp.
+By leveraging **Gemini 2.5 Flash (via OpenRouter)**, the robot can identify the first failed checkpoint in the grasp sequence, classify the failure mode, and trigger a matching recovery primitive such as re-detection, yaw adjustment, or depth correction.
 
 ---
 
@@ -49,20 +49,21 @@ robotics-project/
 
 ### 1. Perception & Detection (`src/baseline.py`)
 - **OWL-ViT Integration**: Uses the `google/owlvit-base-patch32` transformer for open-vocabulary object detection.
-- **Visual Grounding (Red Grid)**: A native 32-pixel red coordinate grid is burned into every image sent to the VLM for calibrated coordinate references.
+- **Ranked Re-detection**: Recovery-time redetection ranks several OWL-ViT candidates with a geometric prior instead of blindly taking the top box.
+- **Alternate Observation Views**: Occlusion recovery can shift the arm to a second observation pose and query `birdview` before retrying.
 
 ### 2. Failure Reasoning (`src/explanation_module.py`)
-- **OpenRouter API**: Interfaces with Gemini 2.5 Flash with a vision-specific system prompt.
-- **JSON Feedback Protocol**: The VLM returns structured JSON containing:
-  - `failure_type`: Qualitative categorization (e.g., "no object reached", "grasp instability").
-  - `explanation`: Detailed reasoning in natural language.
-  - `suggested_action`: Decision to "retry" or "abort".
-  - `object_center_u` / `object_center_v`: Calibrated pixel coordinates for re-attempt.
+- **Two-Stage Temporal Analysis**: Gemini receives five ordered evidence frames from the full grasp sequence.
+- **Checkpoint-Aware JSON Output**: The VLM returns structured JSON containing:
+  - `failed_checkpoint`: The first stage of the grasp sequence that broke.
+  - `failure_type`: The recovery-relevant class for that failure.
+  - `explanation`: Short natural-language reasoning across the temporal frames.
+  - `confidence`: Model confidence in the classification.
 
-### 3. Coordinate Projection Math (`src/baseline.py`)
-- **Decoupled 2D-to-3D Mapping**: Converts VLM pixel corrections into world coordinates treating u/v axes independently.
-- **Robust Projection**: Neighborhood-based back-projection with local median to avoid depth-edge artifacts.
-- **Divergence Detection**: Falls back to initial OWL-ViT target when successive VLM corrections increase error.
+### 3. Recovery Policy Layer (`src/baseline.py`)
+- **Policy Selection from Failure Type**: Recovery primitives are selected programmatically from Gemini's `failure_type`.
+- **Dynamic Retry Budgets**: Conditions like `feedback`, `feedback_double`, and `feedback_6` map to different maximum attempt counts.
+- **Stateful Retrying**: After each non-abort recovery attempt, the believed target position is updated so later retries start from the most recent hypothesis.
 
 ### 4. Control & Grasping Heuristics
 - **The Grasp Plane ($Z=0.825$)**: Hardcoded Z-axis ensures fingers envelop object center of mass.
@@ -77,15 +78,17 @@ The system supports a multi-condition experimental framework (`eval/evaluate.py`
 | Condition | Description | Retries |
 |-----------|-------------|---------|
 | **Baseline** | Standard open-loop attempt | 0 |
-| **Explanation Only** | VLM provides reasoning but no coordinate correction | 0 (analyzes only) |
-| **Feedback** | VLM provides reasoning + corrected coordinates | 1 retry |
-| **Double Feedback** | Two sequential VLM-driven recovery attempts | 2 retries |
+| **Explanation Only** | Temporal failure analysis only, no recovery action | 0 (analyzes only) |
+| **Feedback** | One recovery attempt after temporal failure classification | 1 retry |
+| **Double Feedback** | Two sequential recovery attempts after temporal failure classification | 2 retries |
+| **Feedback_N** | Dynamic retry budget where `N` is the total attempt count | `N-1` retries |
 
 ### Generated Plots
 - `metrics/success_rates.png` — Grouped bar chart of outcome rates
 - `metrics/latency_plot.png` — Box plot of time-to-completion
 - `metrics/attempts_plot.png` — Average attempts per condition
 - `metrics/failure_types_pie.png` — Pie chart of failure type distribution
+- `metrics/failed_checkpoints_pie.png` — Pie chart of the first failed grasp checkpoint
 
 ---
 
@@ -93,10 +96,10 @@ The system supports a multi-condition experimental framework (`eval/evaluate.py`
 
 Every simulation run generates a timestamped directory in `runs/`:
 - `owlvit_clear_view.png` — Initial detection view
-- `llm_input_composite_N.png` — The image sent to Gemini for analysis
-- `llm_log_failure_N.json` — Raw VLM reasoning and coordinates
-- `llm_result_overlay_N.png` — Visual overlay of VLM correction
-- `projection_debug_N.txt` — Detailed projection telemetry
+- `attempt_N/gemini_frames/` — The ordered temporal evidence frames sent to Gemini for attempt `N`
+- `attempt_N/gemini_prompt.txt` — Prompt text used for temporal failure classification
+- `attempt_N/failure_classification.json` — Gemini's `failed_checkpoint`, `failure_type`, and explanation
+- `attempt_N/recovery_action.json` — Recovery primitive and parameters chosen after that classification
 - `attempt_N_run.mp4` — Video recording of each grasp attempt
 
 ---
@@ -123,7 +126,11 @@ Every simulation run generates a timestamped directory in `runs/`:
    ```
 6. **Single Run** (direct baseline execution):
    ```bash
-   python -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback')"
+   python3 -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback')"
+   ```
+7. **Dynamic Retry Budget**:
+   ```bash
+   python3 -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback_6')"
    ```
 
 ---
@@ -131,4 +138,5 @@ Every simulation run generates a timestamped directory in `runs/`:
 ## 📝 Current Status & Findings
 - **X/Y Alignment**: Successfully calibrated via matrix inversion and coordinate transposition.
 - **Depth Success**: Resolved "hovering" issues by implementing a physical table-plane plunge ($Z=0.825$).
-- **Feedback Loop**: Additional retries provide more grasp attempts; VLM corrections show spatial understanding but world-projection fidelity limits recovery success.
+- **Temporal Failure Reasoning**: Gemini now classifies failures from a sequence of grasp-stage frames rather than proposing coordinates directly.
+- **Recovery Loop**: OWL-ViT remains the localizer; Gemini selects the recovery policy and failed checkpoint, while the control stack executes the retry.

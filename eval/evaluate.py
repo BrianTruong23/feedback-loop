@@ -50,7 +50,17 @@ def evaluate():
                 metrics = run_baseline("pick the cereal", condition=condition, trial_idx=trial, seed=seed, processor=processor, model=model, device=device)
             except Exception as e:
                 print(f"Trial failed with error: {e}")
-                metrics = {"task_success": False, "wrong_object": False, "grasp_success": False, "recovery_success": False, "attempts": 1, "latency": 0.0, "failure_type": "runtime_error", "explanation": str(e)}
+                metrics = {
+                    "task_success": False,
+                    "wrong_object": False,
+                    "grasp_success": False,
+                    "recovery_success": False,
+                    "attempts": 1,
+                    "latency": 0.0,
+                    "failure_type": "runtime_error",
+                    "failed_checkpoint": "runtime_error",
+                    "explanation": str(e),
+                }
             
             metrics["condition"] = condition
             metrics["trial"] = trial
@@ -72,12 +82,24 @@ def evaluate():
 
 
 def plot_all_metrics(results, conditions):
-    """Generate all 4 plots: success_rates, latency, attempts, and failure_type pie chart."""
+    """Generate summary plots for success, latency, attempts, failure type, and failed checkpoint."""
     import matplotlib.pyplot as plt
     import seaborn as sns
     
     # Calculate metrics
-    metrics = {cond: {"task_success": 0, "wrong_object": 0, "grasp_success": 0, "recovery_success": 0, "attempts": [], "latency": [], "failure_types": []} for cond in conditions}
+    metrics = {
+        cond: {
+            "task_success": 0,
+            "wrong_object": 0,
+            "grasp_success": 0,
+            "recovery_success": 0,
+            "attempts": [],
+            "latency": [],
+            "failure_types": [],
+            "failed_checkpoints": [],
+        }
+        for cond in conditions
+    }
     counts = {cond: 0 for cond in conditions}
     
     for r in results:
@@ -94,6 +116,9 @@ def plot_all_metrics(results, conditions):
         ft = r.get("failure_type", "")
         if ft:
             metrics[cond]["failure_types"].append(ft)
+        checkpoint = r.get("failed_checkpoint", "")
+        if checkpoint:
+            metrics[cond]["failed_checkpoints"].append(checkpoint)
     
     rates = {cond: {} for cond in conditions}
     for cond in conditions:
@@ -198,6 +223,37 @@ def plot_all_metrics(results, conditions):
         print("  ✓ failure_types_pie.png saved")
     else:
         print("  ⓘ No failure types recorded — skipping pie chart.")
+
+    # --- Plot 5: Failed Checkpoint Pie Chart ---
+    all_failed_checkpoints = []
+    for cond in active_conditions:
+        all_failed_checkpoints.extend(metrics[cond]["failed_checkpoints"])
+
+    if all_failed_checkpoints:
+        from collections import Counter
+        checkpoint_counts = Counter(all_failed_checkpoints)
+
+        plt.figure(figsize=(8, 6))
+        pie_colors = ['#6b9ac4', '#8fc0a9', '#f7c59f', '#ef6f6c', '#b59ae0', '#c7d66d']
+        wedges, texts, autotexts = plt.pie(
+            checkpoint_counts.values(),
+            labels=checkpoint_counts.keys(),
+            autopct='%1.1f%%',
+            colors=pie_colors[:len(checkpoint_counts)],
+            startangle=90,
+            pctdistance=0.85,
+        )
+        for text in texts:
+            text.set_fontsize(10)
+        for autotext in autotexts:
+            autotext.set_fontsize(9)
+        plt.title(f'Failed Checkpoint Distribution (All Conditions, n={len(all_failed_checkpoints)} failures)')
+        plt.tight_layout()
+        plt.savefig('metrics/failed_checkpoints_pie.png', dpi=150)
+        plt.close()
+        print("  ✓ failed_checkpoints_pie.png saved")
+    else:
+        print("  ⓘ No failed checkpoints recorded — skipping checkpoint pie chart.")
     
     print("\nAll plots generated in the metrics/ folder.")
 
