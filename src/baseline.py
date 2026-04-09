@@ -12,21 +12,25 @@ from PIL import Image, ImageDraw
 from robosuite.utils.camera_utils import get_camera_transform_matrix, get_real_depth_map, transform_from_pixels_to_world, project_points_from_world_to_camera
 import robosuite.utils.transform_utils as T
 
-def simplify_environment(env, include_distractor=False):
-    """Reposition objects to create a simplified world, optionally with one distractor."""
-    mode = "1-Bin / 2-Object" if include_distractor else "1-Bin / 1-Object"
-    print(f"--- SIMPLIFYING ENVIRONMENT: {mode} Mode (Cereal target) ---")
+CEREAL_BOX_YAW_DEG = -45.0
+POS_GAIN = 3.4
+MAX_CART_ACTION = 0.45
+POS_TOL = 0.005
+MAX_YAW_ACTION = 0.18
+YAW_TOL = np.deg2rad(1.5)
+DEFAULT_GRIPPER_YAW_DEG = -45.0
+OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
+
+def simplify_environment(env):
+    """Reposition objects to create a 1-bin / 1-object simplified world (Cereal only)."""
+    print("--- SIMPLIFYING ENVIRONMENT: 1-Bin / 1-Object Mode (Cereal only) ---")
     try:
-        # MuJoCo free joints store pose as xyz + quaternion (w, x, y, z).
-        # Use a fixed 90 deg yaw so the cereal box is axis-aligned instead of diagonal.
-        cereal_yaw_quat = np.array([np.cos(np.pi / 4), 0.0, 0.0, np.sin(np.pi / 4)])
+        cereal_pos = np.array([0.08, -0.25, 0.9])
+        half_yaw_rad = np.deg2rad(CEREAL_BOX_YAW_DEG) / 2.0
+        cereal_quat = np.array([np.cos(half_yaw_rad), 0.0, 0.0, np.sin(half_yaw_rad)])
 
-        hidden_objects = ["Bread_joint0", "Can_joint0"]
-        if not include_distractor:
-            hidden_objects.append("Milk_joint0")
-
-        # Hide all objects except the benchmark target (and optional distractor)
-        for obj_name in hidden_objects:
+        # Hide all objects except Cereal
+        for obj_name in ["Bread_joint0", "Can_joint0", "Milk_joint0"]:
             j_id = env.sim.model.joint_name2id(obj_name)
             q_idx = env.sim.model.jnt_qposadr[j_id]
             env.sim.data.qpos[q_idx : q_idx + 3] = np.array([5.0, 5.0, -1.0])
@@ -34,19 +38,20 @@ def simplify_environment(env, include_distractor=False):
         # Place Cereal in the center of Bin 1 with clearance from all walls
         cereal_id = env.sim.model.joint_name2id("Cereal_joint0")
         cereal_idx = env.sim.model.jnt_qposadr[cereal_id]
-        env.sim.data.qpos[cereal_idx : cereal_idx + 3] = np.array([0.08, -0.25, 0.9])
-        env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_yaw_quat
-
-        if include_distractor:
-            milk_id = env.sim.model.joint_name2id("Milk_joint0")
-            milk_idx = env.sim.model.jnt_qposadr[milk_id]
-            env.sim.data.qpos[milk_idx : milk_idx + 3] = np.array([0.18, -0.18, 0.9])
+        env.sim.data.qpos[cereal_idx : cereal_idx + 3] = cereal_pos
+        env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_quat
 
         env.sim.forward()  # Force physics update
 
         # Let physics settle so GT position is stable before any GT read
         for _ in range(50):
             env.sim.step()
+
+        env.sim.data.qpos[cereal_idx : cereal_idx + 3] = cereal_pos
+        env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_quat
+        qvel_idx = env.sim.model.jnt_dofadr[cereal_id]
+        env.sim.data.qvel[qvel_idx : qvel_idx + 6] = 0.0
+        env.sim.forward()
     except Exception as e:
         print(f"Warning: Physics simplification failed: {e}")
 
@@ -121,25 +126,7 @@ def get_max_attempts_for_condition(condition):
         return max(1, int(match.group(1)))
     return 1
 
-
-FAILGEN_FAILURE_TYPES = {
-    "xy_offset_miss": "no_object_reached",
-    "wrong_object_target": "wrong_object",
-    "bad_yaw": "needs_yaw_adjustment",
-    "shallow_depth": "depth_plane_bad",
-    "post_contact_slip": "slip_after_contact",
-}
-
-def run_baseline(
-    instruction="pick the milk",
-    condition="feedback",
-    trial_idx=0,
-    seed=None,
-    processor=None,
-    model=None,
-    device=None,
-    injected_failure=None,
-):
+def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
     print(f"\n--- Starting Trial {trial_idx} | Condition: {condition} ---")
     print(f"Language Instruction: '{instruction}'")
     
@@ -153,8 +140,7 @@ def run_baseline(
         "latency": 0.0,
         "failure_type": "",
         "failed_checkpoint": "",
-        "explanation": "",
-        "injected_failure": injected_failure or "",
+        "explanation": ""
     }
     max_attempts = get_max_attempts_for_condition(condition)
     
@@ -211,12 +197,6 @@ def run_baseline(
         render_camera="frontview",
     )
 
-    POS_GAIN = 3.4
-    MAX_CART_ACTION = 0.45
-    POS_TOL = 0.005
-    MAX_YAW_ACTION = 0.18
-    YAW_TOL = np.deg2rad(1.5)
-    OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
 
     def step_towards(current_obs, target_xyz, gripper_action, steps=10, settle=False):
         target_xyz = np.array(target_xyz, dtype=float)
@@ -245,19 +225,28 @@ def run_baseline(
         return current_obs
 
     def rotate_yaw_in_place(current_obs, yaw_delta_rad, gripper_action, steps=20):
-        if abs(yaw_delta_rad) < YAW_TOL:
+        def wrap_to_pi(angle_rad):
+            return (angle_rad + np.pi) % (2.0 * np.pi) - np.pi
+
+        def current_eef_yaw(obs_ref):
+            eef_rot = T.quat2mat(obs_ref["robot0_eef_quat"])
+            return np.arctan2(eef_rot[1, 0], eef_rot[0, 0])
+
+        normalized_delta = wrap_to_pi(yaw_delta_rad)
+        if abs(normalized_delta) < YAW_TOL:
             return current_obs
 
-        remaining = float(yaw_delta_rad)
+        start_yaw = current_eef_yaw(current_obs)
+        target_yaw = wrap_to_pi(start_yaw + normalized_delta)
         for _ in range(steps):
-            if abs(remaining) < YAW_TOL:
+            yaw_error = wrap_to_pi(target_yaw - current_eef_yaw(current_obs))
+            if abs(yaw_error) < YAW_TOL:
                 break
 
             action = np.zeros(7)
-            action[5] = np.clip(remaining * 0.35, -MAX_YAW_ACTION, MAX_YAW_ACTION)
+            action[5] = np.clip(yaw_error * 0.8, -MAX_YAW_ACTION, MAX_YAW_ACTION)
             action[6] = gripper_action
             current_obs, _, _, _ = env.step(action)
-            remaining -= action[5]
             if video_enabled and video_writer:
                 video_writer.append_data(current_obs["frontview_image"][::-1])
 
@@ -333,50 +322,18 @@ def run_baseline(
         )
         return best_pos
 
-    def get_named_object_pos(name_hint):
-        for obj in env.objects:
-            if name_hint.lower() in obj.name.lower():
-                body_id = env.sim.model.body_name2id(obj.root_body)
-                return env.sim.data.body_xpos[body_id].copy()
-        return None
-
-    def build_failgen_injection(target_pos, target_name, failure_name):
-        spec = {
-            "target_pos": target_pos.copy(),
-            "pre_yaw_deg": 0.0,
-            "settle_steps": 6,
-            "release_during_lift": False,
-            "birdview_before": False,
-        }
-        if not failure_name:
-            return spec
-
-        if failure_name == "xy_offset_miss":
-            spec["target_pos"][:2] += np.array([0.055, -0.045])
-        elif failure_name == "wrong_object_target":
-            distractor_name = "Milk" if target_name != "Milk" else "Can"
-            distractor_pos = get_named_object_pos(distractor_name)
-            if distractor_pos is not None:
-                spec["target_pos"] = distractor_pos.copy()
-                spec["target_pos"][2] = target_pos[2]
-        elif failure_name == "bad_yaw":
-            spec["pre_yaw_deg"] = 90.0
-        elif failure_name == "shallow_depth":
-            spec["target_pos"][2] += 0.04
-        elif failure_name == "post_contact_slip":
-            spec["release_during_lift"] = True
-        return spec
-
     # 3. Task Execution
     obs = env.reset()
     
     # SIMPLIFY: Re-position objects into 1-bin / 2-object configuration
-    simplify_environment(env, include_distractor=(injected_failure == "wrong_object_target"))
+    simplify_environment(env)
     
     # CLEAR VIEW: retract along the same smoothed motion profile used for grasping.
     print("--- CLEAR VIEW: Retracting arm for initial perception ---")
     retract_pos = np.array([0.4, -0.6, 1.4])
     obs = step_towards(obs, retract_pos, gripper_action=-1, steps=12)
+    print(f"--- DEFAULT YAW: Rotating gripper to {DEFAULT_GRIPPER_YAW_DEG:.0f}° before detection/grasp ---")
+    obs = rotate_yaw_in_place(obs, np.deg2rad(DEFAULT_GRIPPER_YAW_DEG), gripper_action=-1, steps=40)
     owlvit_frontview = create_frontview_image(obs, env)
     try:
         Image.fromarray(owlvit_frontview).save(os.path.join(run_dir, "owlvit_clear_view.png"))
@@ -481,18 +438,8 @@ def run_baseline(
     # Temporal evidence frames captured at each grasp checkpoint for Stage 1 classification
     frames = {}
 
-    def perform_grasp_attempt(
-        current_obs,
-        target_pos,
-        settle_steps=6,
-        pre_yaw_deg=0.0,
-        release_during_lift=False,
-        birdview_before=False,
-    ):
+    def perform_grasp_attempt(current_obs, target_pos, settle_steps=6, pre_yaw_deg=0.0):
         attempt_frames = {}
-
-        if birdview_before:
-            attempt_frames["birdview_pre_hover"] = current_obs["birdview_image"][::-1].copy()
 
         print("Action Plan: Hovering above object...")
         hover_pos = target_pos.copy()
@@ -515,34 +462,16 @@ def run_baseline(
         current_obs = step_towards(current_obs, grasp_pos, gripper_action=1, steps=settle_steps, settle=True)
         attempt_frames["post_close"] = create_frontview_image(current_obs, env)
 
-        if release_during_lift:
-            print("Action Plan: Injecting slip after contact for failgen benchmark...")
-            release_action = np.zeros(7)
-            release_action[6] = -1
-            current_obs, _, _, _ = env.step(release_action)
-            if video_enabled and video_writer:
-                video_writer.append_data(current_obs["frontview_image"][::-1])
-
         print("Action Plan: Lifting...")
         lift_pos = grasp_pos.copy()
         lift_pos[2] += 0.3
-        lift_gripper_action = -1 if release_during_lift else 1
-        current_obs = step_towards(current_obs, lift_pos, gripper_action=lift_gripper_action, steps=10)
+        current_obs = step_towards(current_obs, lift_pos, gripper_action=1, steps=10)
         attempt_frames["post_lift"] = create_frontview_image(current_obs, env)
 
         lifted_any, target_ok, wrong_ok = check_objects_lifted(env, target_obj_name)
         return current_obs, attempt_frames, lifted_any, target_ok, wrong_ok
 
-    failgen_spec = build_failgen_injection(obj_pos, target_obj_name, injected_failure)
-    obj_pos = failgen_spec["target_pos"].copy()
-    obs, frames, lifted_any, target_picked, wrong_picked = perform_grasp_attempt(
-        obs,
-        obj_pos,
-        settle_steps=failgen_spec["settle_steps"],
-        pre_yaw_deg=failgen_spec["pre_yaw_deg"],
-        release_during_lift=failgen_spec["release_during_lift"],
-        birdview_before=failgen_spec["birdview_before"],
-    )
+    obs, frames, lifted_any, target_picked, wrong_picked = perform_grasp_attempt(obs, obj_pos)
 
     if target_picked:
         print("\nOutcome: SUCCESS")
