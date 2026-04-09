@@ -70,60 +70,11 @@ def draw_gripper_gizmo(img_array, obs, env, camera_name):
         print(f"Gizmo Draw Error: {e}")
         return img_array
 
-def create_composite_image(obs, env):
-    """Create a side-by-side (Front + Bird) image for the VLM."""
-    front = obs["frontview_image"][::-1]
-    bird = obs["birdview_image"][::-1]
-    
-    # Draw grids and gizmos on both
-    front_grid = draw_red_grid_on_array(front)
-    front_gizmo = draw_gripper_gizmo(front_grid, obs, env, "frontview")
-    
-    bird_grid = draw_red_grid_on_array(bird)
-    bird_gizmo = draw_gripper_gizmo(bird_grid, obs, env, "birdview")
-    
-    # Horizontal stack
-    composite = np.hstack([front_gizmo, bird_gizmo])
-    return composite
-
 def create_frontview_image(obs, env):
-    """Create the front-view image used for Gemini localization."""
+    """Render a front-view frame with red pixel-coordinate grid and gripper gizmo."""
     front = obs["frontview_image"][::-1]
     front_grid = draw_red_grid_on_array(front)
     return draw_gripper_gizmo(front_grid, obs, env, "frontview")
-
-def draw_target_anchor_on_composite(image_array, front_u, front_v):
-    """Mark the last commanded front-view target so Gemini has a visible anchor."""
-    image = Image.fromarray(image_array.copy())
-    draw = ImageDraw.Draw(image)
-    h, w = image_array.shape[:2]
-    anchor_x = int(np.clip(round(front_u), 0, w - 1))
-    anchor_y = int(np.clip(round(front_v), 0, h - 1))
-    cross_len = 10
-    color = (0, 255, 255)
-
-    draw.line([(anchor_x - cross_len, anchor_y), (anchor_x + cross_len, anchor_y)], fill=color, width=3)
-    draw.line([(anchor_x, anchor_y - cross_len), (anchor_x, anchor_y + cross_len)], fill=color, width=3)
-    draw.ellipse([(anchor_x - 4, anchor_y - 4), (anchor_x + 4, anchor_y + 4)], outline=color, width=2)
-    draw.text((anchor_x + 8, max(anchor_y - 18, 0)), "LAST TARGET", fill=color)
-    return np.array(image)
-
-def draw_gemini_prediction_on_composite(image_array, last_u, last_v, predicted_u, predicted_v):
-    """Overlay Gemini's corrected front-view contact point on the image."""
-    image = Image.fromarray(image_array.copy())
-    draw = ImageDraw.Draw(image)
-    h, w = image_array.shape[:2]
-
-    start_x = int(np.clip(round(last_u), 0, w - 1))
-    start_y = int(np.clip(round(last_v), 0, h - 1))
-    pred_x = int(np.clip(round(predicted_u), 0, w - 1))
-    pred_y = int(np.clip(round(predicted_v), 0, h - 1))
-    color = (255, 64, 0)
-
-    draw.line([(start_x, start_y), (pred_x, pred_y)], fill=color, width=3)
-    draw.ellipse([(pred_x - 6, pred_y - 6), (pred_x + 6, pred_y + 6)], outline=color, width=3)
-    draw.text((pred_x + 8, max(pred_y - 18, 0)), "GEMINI TARGET", fill=color)
-    return np.array(image)
 
 def draw_red_grid_on_array(img_array):
     """Draw a 32-pixel red coordinate grid on the image array."""
@@ -143,91 +94,6 @@ def draw_red_grid_on_array(img_array):
         return np.array(image)
     except:
         return img_array
-
-def robust_project_front_pixel_to_world(real_depth, cam_mat, img_h, img_w, u_px, v_px, reference_world=None, search_radius=12, stride=2):
-    """
-    Back-project a front-view pixel to world coordinates using a local pixel neighborhood.
-    This avoids large world-space jumps when the exact corrected pixel lands on an edge or background.
-    """
-    candidates = []
-    center_u = float(np.clip(u_px, 0, img_w - 1))
-    center_v = float(np.clip(v_px, 0, img_h - 1))
-
-    for dv in range(-search_radius, search_radius + 1, stride):
-        for du in range(-search_radius, search_radius + 1, stride):
-            sample_u = float(np.clip(center_u + du, 0, img_w - 1))
-            sample_v = float(np.clip(center_v + dv, 0, img_h - 1))
-            sample_orig_v = (img_h - 1) - sample_v
-            sample_pixels = np.array([sample_orig_v, sample_u])
-
-            try:
-                world_pt = transform_from_pixels_to_world(sample_pixels, real_depth, cam_mat)
-            except Exception:
-                continue
-
-            if not np.all(np.isfinite(world_pt)):
-                continue
-
-            pixel_dist = np.hypot(du, dv)
-            world_xy_penalty = 0.0
-            if reference_world is not None:
-                world_xy_penalty = np.linalg.norm(world_pt[:2] - reference_world[:2]) * 250.0
-            score = pixel_dist + world_xy_penalty
-            candidates.append((score, pixel_dist, world_pt, sample_u, sample_v))
-
-    if not candidates:
-        sample_orig_v = (img_h - 1) - center_v
-        return transform_from_pixels_to_world(np.array([sample_orig_v, center_u]), real_depth, cam_mat), center_u, center_v
-
-    candidates.sort(key=lambda item: item[0])
-    top_world = np.array([item[2] for item in candidates[: min(9, len(candidates))]])
-    median_world = np.median(top_world, axis=0)
-    best = min(candidates, key=lambda item: np.linalg.norm(item[2][:2] - median_world[:2]) + item[1] * 0.1)
-    return best[2], best[3], best[4]
-
-def apply_decoupled_pixel_update(real_depth, cam_mat, img_h, img_w, last_u, last_v, new_u, new_v, reference_world):
-    """
-    Convert Gemini's image-space correction into a world-space target by treating u and v
-    as separate updates. Each image axis only updates its dominant planar world axis, while
-    the other world dimensions stay anchored to the previous target.
-    """
-    base_world, base_used_u, base_used_v = robust_project_front_pixel_to_world(
-        real_depth, cam_mat, img_h, img_w, last_u, last_v, reference_world=reference_world
-    )
-    u_world, used_u, _ = robust_project_front_pixel_to_world(
-        real_depth, cam_mat, img_h, img_w, new_u, last_v, reference_world=reference_world
-    )
-    v_world, _, used_v = robust_project_front_pixel_to_world(
-        real_depth, cam_mat, img_h, img_w, last_u, new_v, reference_world=reference_world
-    )
-
-    delta_u_world = u_world[:2] - base_world[:2]
-    delta_v_world = v_world[:2] - base_world[:2]
-
-    if abs(delta_u_world[0]) >= abs(delta_u_world[1]):
-        u_axis = 0
-    else:
-        u_axis = 1
-
-    # Force v to control the other planar axis so the image axes stay decoupled.
-    v_axis = 1 - u_axis
-
-    new_world = reference_world.copy()
-    new_world[u_axis] = reference_world[u_axis] + delta_u_world[u_axis]
-    new_world[v_axis] = reference_world[v_axis] + delta_v_world[v_axis]
-
-    return new_world, {
-        "base_used_u": base_used_u,
-        "base_used_v": base_used_v,
-        "used_u": used_u,
-        "used_v": used_v,
-        "u_axis": u_axis,
-        "v_axis": v_axis,
-        "delta_u_world_x": float(delta_u_world[0]),
-        "delta_u_world_y": float(delta_u_world[1]),
-        "delta_v_world_x": float(delta_v_world[0]),
-        "delta_v_world_y": float(delta_v_world[1]),
-    }
 
 def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
     print(f"\n--- Starting Trial {trial_idx} | Condition: {condition} ---")
@@ -426,12 +292,9 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     
     pt_3d = transform_from_pixels_to_world(pixels, real_depth, cam_mat)
 
-    body_map = {"Cereal": "Cereal_main", "Milk": "Milk_main", "Bread": "Bread_main", "Can": "Can_main"}
-    sim_body_name = body_map.get(target_obj_name, target_obj_name)
     pt_3d[2] = 0.825
     print("Using OWL-ViT 2D detection + depth projection only for the initial grasp target.")
 
-    # Store for divergence fallback in the retry loop
     initial_owlvit_3d = pt_3d.copy()
 
     print(f"Targeting '{target_obj_name}' at 3D coordinate {pt_3d}...")
@@ -441,27 +304,33 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
     HOME_POS = np.array([0.4, -0.6, 1.4])
 
+    # Temporal evidence frames captured at each grasp checkpoint for Stage 1 classification
+    frames = {}
+
     # Move above object
     print("Action Plan: Hovering above object...")
     hover_pos = obj_pos.copy()
     hover_pos[2] += 0.2
-    obs = step_towards(obs, hover_pos, gripper_action=-1, steps=10) # Open gripper (-1)
-    
-    # Move down to object center (Z from GT so gripper wraps the object, not the floor)
+    obs = step_towards(obs, hover_pos, gripper_action=-1, steps=10)
+    frames["pre_hover"] = create_frontview_image(obs, env)
+
+    # Move down to object center
     print("Action Plan: Lowering to grasp...")
     grasp_pos = obj_pos.copy()
     obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=8)
-    
+    frames["contact"] = create_frontview_image(obs, env)
+
     # Close gripper
     print("Action Plan: Closing gripper...")
-    obs = step_towards(obs, grasp_pos, gripper_action=1, steps=6, settle=True) # Close gripper (1)
-    last_contact_world = obs['robot0_eef_pos'].copy()
-    
+    obs = step_towards(obs, grasp_pos, gripper_action=1, steps=6, settle=True)
+    frames["post_close"] = create_frontview_image(obs, env)
+
     # Lift object
     print("Action Plan: Lifting...")
     lift_pos = grasp_pos.copy()
     lift_pos[2] += 0.3
     obs = step_towards(obs, lift_pos, gripper_action=1, steps=10)
+    frames["post_lift"] = create_frontview_image(obs, env)
     
     # Check outcome
     # Check outcome helper
@@ -494,231 +363,164 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             metrics["grasp_success"] = True
             
         if condition in ["explanation_only", "feedback", "feedback_double", "feedback_6"]:
-            max_retries = 1 if condition == "feedback" else (2 if condition == "feedback_double" else (2 if condition == "feedback_6" else 0))
-            error_history = []  # Fix 6: track XY error across attempts for divergence detection
+            from src.explanation_module import classify_failure, OPENROUTER_MODEL
 
-            for retry_idx in range(max_retries + 1):
-                # Fix 2+3: Full retract FIRST so depth and composite are from the same clean unoccluded frame
-                print("--- FULL RETRACT: Arm to start position for clean analysis ---")
-                obs = step_towards(obs, HOME_POS, gripper_action=-1, steps=10)
+            # --- Reset: retract arm so scene is unoccluded for the final frame ---
+            print("--- FULL RETRACT: Arm to home for clean scene capture ---")
+            obs = step_towards(obs, HOME_POS, gripper_action=-1, steps=10)
+            frames["retracted"] = create_frontview_image(obs, env)
 
-                # Capture clean depth and composite from the same retracted frame
-                clean_depth = obs["frontview_depth"].copy()
-                clean_frontview = create_frontview_image(obs, env)
-
-                # Use the actual grasp-contact point, not the commanded target, as Gemini's correction anchor.
-                cam_transform_fv = get_camera_transform_matrix(env.sim, "frontview", IMG_H, IMG_W)
-                anchor_world = last_contact_world if 'last_contact_world' in locals() else obj_pos
-                anchor_px = project_points_from_world_to_camera(anchor_world.reshape(1, 3), cam_transform_fv, IMG_H, IMG_W)[0]
-                last_grasp_v_px, last_grasp_u_px = float(anchor_px[0]), float(anchor_px[1])
-                gemini_composite = draw_target_anchor_on_composite(clean_frontview, last_grasp_u_px, last_grasp_v_px)
+            if render_enabled and run_dir:
                 try:
-                    gt_pos = env.sim.data.get_body_xpos(sim_body_name)
-                    error_history.append(float(np.linalg.norm((obj_pos - gt_pos)[:2])))
+                    for fname, frame in frames.items():
+                        Image.fromarray(frame).save(os.path.join(run_dir, f"frame_{fname}.png"))
                 except Exception:
                     pass
 
-                try:
-                    from src.explanation_module import analyze_failure, OPENROUTER_MODEL
+            # --- Stage 1: Classify failure from 5 temporal frames ---
+            # VLM reasons over the full grasp sequence; it does NOT provide pixel corrections.
+            print(f"Querying {OPENROUTER_MODEL} for failure classification (5 frames)...")
+            try:
+                failure_result = classify_failure(target_obj_name, frames)
+            except Exception as e:
+                print(f"Failure classification error: {e}")
+                failure_result = None
 
-                    print(
-                        f"Querying {OPENROUTER_MODEL} with clean retracted view "
-                        f"(last grasp anchor: u={last_grasp_u_px:.0f} v={last_grasp_v_px:.0f})..."
+            if not failure_result:
+                print("Gemini returned no classification. Ending trial.")
+            else:
+                failure_type = failure_result["failure_type"]
+                failed_checkpoint = failure_result.get("failed_checkpoint", "unknown")
+                print(f"\n[GEMINI FAILURE CLASSIFICATION]")
+                print(f"  Failed checkpoint : {failed_checkpoint}")
+                print(f"  Failure type      : {failure_type}")
+                print(f"  Explanation       : {failure_result['explanation']}")
+                print(f"  Confidence        : {failure_result['confidence']:.2f}")
+
+                metrics["failure_type"] = failure_type
+                metrics["explanation"] = failure_result["explanation"]
+
+                if render_enabled and run_dir:
+                    try:
+                        import json
+                        with open(os.path.join(run_dir, "failure_classification.json"), "w") as f:
+                            json.dump(failure_result, f, indent=2)
+                    except Exception:
+                        pass
+
+                # --- Stage 2: Programmatic recovery policies ---
+                # OWL-ViT remains the primary localizer. VLM only identified the failure type.
+                # Each policy maps to a concrete mechanical action — no pixel regression from VLM.
+
+                OWLVIT_PROMPTS = {
+                    "Milk":   ("milk carton",    "white milk carton with red label"),
+                    "Bread":  ("loaf of bread",  "tan rectangular bread loaf box"),
+                    "Cereal": ("cereal box",     "red rectangular cereal box"),
+                    "Can":    ("soda can",       "red cylindrical metal soda can"),
+                }
+
+                def do_grasp(current_obs, target_pos, settle_steps=6, pre_yaw_deg=0.0):
+                    """Hover → optional yaw rotation → lower → close gripper → lift."""
+                    hover = target_pos.copy()
+                    hover[2] += 0.2
+                    current_obs = step_towards(current_obs, hover, gripper_action=-1, steps=10)
+                    if abs(pre_yaw_deg) > 0.5:
+                        print(f"  Recovery: rotating gripper {pre_yaw_deg:.0f}° before descent...")
+                        current_obs = rotate_yaw_in_place(
+                            current_obs, np.deg2rad(pre_yaw_deg), gripper_action=-1, steps=20
+                        )
+                    gp = target_pos.copy()
+                    current_obs = step_towards(current_obs, gp, gripper_action=-1, steps=8)
+                    current_obs = step_towards(current_obs, gp, gripper_action=1, steps=settle_steps, settle=True)
+                    lp = gp.copy()
+                    lp[2] += 0.3
+                    current_obs = step_towards(current_obs, lp, gripper_action=1, steps=10)
+                    _, t_ok, w_ok = check_objects_lifted(env, target_obj_name)
+                    return current_obs, t_ok, w_ok
+
+                def redetect_and_grasp(current_obs, disambiguation=False):
+                    """Re-run OWL-ViT from the clean retracted view without VLM pixel regression."""
+                    base_p, disam_p = OWLVIT_PROMPTS.get(
+                        target_obj_name, (target_obj_name.lower(), target_obj_name.lower())
                     )
-                    explanation_json = analyze_failure(target_obj_name, gemini_composite, last_grasp_u_px, last_grasp_v_px)
+                    query = disam_p if disambiguation else base_p
+                    img_raw = current_obs["frontview_image"][::-1]
+                    texts_r = [[f"a photo of a {query}"]]
+                    inp_r = processor(text=texts_r, images=img_raw, return_tensors="pt").to(device)
+                    with torch.no_grad():
+                        out_r = model(**inp_r)
+                    ts_r = torch.tensor([img_raw.shape[:2]]).to(device)
+                    res_r = processor.post_process_grounded_object_detection(
+                        outputs=out_r, target_sizes=ts_r, text_labels=texts_r, threshold=0.0
+                    )
+                    if len(res_r[0]["scores"]) == 0:
+                        print("  Re-detection: no object found, falling back to initial OWL-ViT target.")
+                        return do_grasp(current_obs, initial_owlvit_3d)
+                    bi = torch.argmax(res_r[0]["scores"])
+                    bx = res_r[0]["boxes"][bi].cpu().numpy()
+                    sc = res_r[0]["scores"][bi].cpu().numpy()
+                    print(f"  Re-detection: '{target_obj_name}' score={sc:.3f}")
+                    ru = (bx[0] + bx[2]) / 2.0
+                    rv = (bx[1] + bx[3]) / 2.0
+                    rd = get_real_depth_map(env.sim, current_obs["frontview_depth"])
+                    rcm = np.linalg.inv(get_camera_transform_matrix(env.sim, "frontview", IMG_H, IMG_W))
+                    new_pos = transform_from_pixels_to_world(np.array([(IMG_H - 1) - rv, ru]), rd, rcm)
+                    new_pos[2] = initial_owlvit_3d[2]
+                    print(f"  Re-detected target at {new_pos}")
+                    return do_grasp(current_obs, new_pos)
 
-                    if explanation_json:
-                        if render_enabled and run_dir:
-                            try:
-                                import json
-                                log_path = os.path.join(run_dir, f"llm_log_failure_{retry_idx+1}.json")
-                                with open(log_path, "w") as f:
-                                    json.dump(explanation_json, f, indent=2)
+                metrics["attempts"] += 1
+                print(f"\n--- RECOVERY ATTEMPT {metrics['attempts']} | policy={failure_type} ---")
 
-                                Image.fromarray(gemini_composite).save(os.path.join(run_dir, f"llm_input_composite_{retry_idx+1}.png"))
-                            except Exception: pass
+                if failure_type in ("wrong_object", "no_object_reached", "target_occluded"):
+                    # Re-detect with OWL-ViT; use disambiguation prompt for wrong-object case
+                    obs, target_ok, wrong_ok = redetect_and_grasp(
+                        obs, disambiguation=(failure_type == "wrong_object")
+                    )
 
-                        metrics["failure_type"] = explanation_json.get("failure_type", "")
-                        metrics["explanation"] = explanation_json.get("explanation", "")
+                elif failure_type in ("grasp_pose_bad", "needs_yaw_adjustment"):
+                    # Rotate yaw and re-approach same XY target
+                    yaw = 90.0 if failure_type == "needs_yaw_adjustment" else 45.0
+                    obs, target_ok, wrong_ok = do_grasp(obs, obj_pos, pre_yaw_deg=yaw)
 
-                        print(f"\n[GEMINI FEEDBACK JSON]")
-                        print(f"Failure Type: {explanation_json.get('failure_type')}")
-                        print(f"Explanation: {explanation_json.get('explanation')}")
-                        print(f"Action: {explanation_json.get('suggested_action')} | delta_u: {explanation_json.get('delta_u')} delta_v: {explanation_json.get('delta_v')} yaw: {explanation_json.get('suggested_yaw_delta_deg')}deg")
+                elif failure_type == "slip_after_contact":
+                    # Grab 1 cm lower on the object; increase gripper settle time
+                    slip_pos = obj_pos.copy()
+                    slip_pos[2] -= 0.01
+                    obs, target_ok, wrong_ok = do_grasp(obs, slip_pos, settle_steps=12)
 
-                        if retry_idx < max_retries and str(explanation_json.get("suggested_action", "")).lower().strip() == "retry":
-                            metrics["attempts"] += 1
-                            print(f"\n--- INITIATING ATTEMPT {metrics['attempts']} ---")
+                elif failure_type == "depth_plane_bad":
+                    # Descend 2 cm deeper than the initial Z estimate
+                    adj_pos = obj_pos.copy()
+                    adj_pos[2] -= 0.02
+                    obs, target_ok, wrong_ok = do_grasp(obs, adj_pos)
 
-                            if render_enabled and video_writer is not None:
-                                try:
-                                    video_writer.close()
-                                except Exception: pass
-                                current_vid_path = os.path.join(run_dir, f"attempt_{metrics['attempts']}_run.mp4")
-                                try:
-                                    import imageio
-                                    video_writer = imageio.get_writer(current_vid_path, fps=20)
-                                except Exception: pass
+                else:  # abort_unrecoverable
+                    print("  Recovery: abort_unrecoverable — no retry possible.")
+                    target_ok, wrong_ok = False, False
 
-                            # Fix 6: Divergence check — fall back to OWL-ViT if XY error grew over last 2 attempts
-                            diverged = len(error_history) >= 3 and error_history[-1] > error_history[-3]
-                            if diverged:
-                                print("--- DIVERGENCE DETECTED: XY error is growing. Falling back to initial OWL-ViT target ---")
-                                pt_3d_new = initial_owlvit_3d.copy()
-                                u_new = last_grasp_u_px
-                                v_new = last_grasp_v_px
-                            else:
-                                # Fix 1: Apply signed pixel delta anchored to last commanded grasp pixel
-                                object_center_u = explanation_json.get("object_center_u")
-                                object_center_v = explanation_json.get("object_center_v")
-                                if object_center_u is not None and object_center_v is not None:
-                                    u_new = float(object_center_u)
-                                    v_new = float(object_center_v)
-                                    delta_u = u_new - last_grasp_u_px
-                                    delta_v = last_grasp_v_px - v_new
-                                else:
-                                    delta_u = float(explanation_json.get("delta_u", 0.0))
-                                    delta_v = float(explanation_json.get("delta_v", 0.0))
-                                    u_new = last_grasp_u_px + delta_u
-                                    v_new = last_grasp_v_px - delta_v
+                if render_enabled and video_writer is not None:
+                    try:
+                        video_writer.close()
+                    except Exception:
+                        pass
+                    current_vid_path = os.path.join(run_dir, f"attempt_{metrics['attempts']}_run.mp4")
+                    try:
+                        import imageio
+                        video_writer = imageio.get_writer(current_vid_path, fps=20)
+                    except Exception:
+                        pass
 
-                                # Fix 2+3: Back-project using clean depth from the same frame Gemini analyzed
-                                real_depth_clean = get_real_depth_map(env.sim, clean_depth)
-                                cam_mat_clean = np.linalg.inv(cam_transform_fv)
-                                pt_3d_new, projection_info = apply_decoupled_pixel_update(
-                                    real_depth_clean,
-                                    cam_mat_clean,
-                                    IMG_H,
-                                    IMG_W,
-                                    last_grasp_u_px,
-                                    last_grasp_v_px,
-                                    u_new,
-                                    v_new,
-                                    obj_pos,
-                                )
-                                used_u = projection_info["used_u"]
-                                used_v = projection_info["used_v"]
-
-                                # Fix 4: Keep X/Y from projection, force Z to initial grasp contact level
-                                pt_3d_new[2] = initial_owlvit_3d[2]
-                                xy_shift = np.linalg.norm(pt_3d_new[:2] - obj_pos[:2])
-                                if xy_shift > 0.08:
-                                    print(f"Projected retry target jumped {xy_shift:.3f}m; clamping to preserve locality.")
-                                    direction = pt_3d_new[:2] - obj_pos[:2]
-                                    pt_3d_new[:2] = obj_pos[:2] + direction / max(np.linalg.norm(direction), 1e-8) * 0.08
-
-                                print(
-                                    f"Gemini requested delta_u={delta_u:.1f}, delta_v={delta_v:.1f}; "
-                                    f"using front pixel u={used_u:.1f}, v={used_v:.1f} for world projection."
-                                )
-
-                            if render_enabled and run_dir:
-                                try:
-                                    prediction_overlay = draw_gemini_prediction_on_composite(
-                                        gemini_composite,
-                                        last_grasp_u_px,
-                                        last_grasp_v_px,
-                                        u_new,
-                                        v_new,
-                                    )
-                                    Image.fromarray(prediction_overlay).save(
-                                        os.path.join(run_dir, f"llm_result_overlay_{retry_idx+1}.png")
-                                    )
-
-                                    debug_lines = [
-                                        f"last_target_u={last_grasp_u_px:.3f}",
-                                        f"last_target_v={last_grasp_v_px:.3f}",
-                                        f"gemini_object_center_u={u_new:.3f}",
-                                        f"gemini_object_center_v={v_new:.3f}",
-                                        f"delta_u={delta_u:.3f}",
-                                        f"delta_v={delta_v:.3f}",
-                                    ]
-                                    if 'used_u' in locals() and 'used_v' in locals():
-                                        debug_lines.extend([
-                                            f"base_used_projection_u={projection_info['base_used_u']:.3f}",
-                                            f"base_used_projection_v={projection_info['base_used_v']:.3f}",
-                                            f"used_projection_u={used_u:.3f}",
-                                            f"used_projection_v={used_v:.3f}",
-                                            f"u_updates_world_axis={projection_info['u_axis']}",
-                                            f"v_updates_world_axis={projection_info['v_axis']}",
-                                            f"delta_u_world_x={projection_info['delta_u_world_x']:.6f}",
-                                            f"delta_u_world_y={projection_info['delta_u_world_y']:.6f}",
-                                            f"delta_v_world_x={projection_info['delta_v_world_x']:.6f}",
-                                            f"delta_v_world_y={projection_info['delta_v_world_y']:.6f}",
-                                        ])
-                                    debug_lines.extend([
-                                        f"projected_world_x={pt_3d_new[0]:.6f}",
-                                        f"projected_world_y={pt_3d_new[1]:.6f}",
-                                        f"projected_world_z={pt_3d_new[2]:.6f}",
-                                    ])
-                                    try:
-                                        gt_pos = env.sim.data.get_body_xpos(sim_body_name)
-                                        debug_lines.extend([
-                                            f"ground_truth_world_x={gt_pos[0]:.6f}",
-                                            f"ground_truth_world_y={gt_pos[1]:.6f}",
-                                            f"ground_truth_world_z={gt_pos[2]:.6f}",
-                                        ])
-                                    except Exception:
-                                        pass
-                                    with open(os.path.join(run_dir, f"projection_debug_{retry_idx+1}.txt"), "w") as f:
-                                        f.write("\n".join(debug_lines) + "\n")
-                                except Exception:
-                                    pass
-
-                            print(f"Targeting '{target_obj_name}' at NEW 3D coordinate {pt_3d_new}...")
-                            obj_pos = pt_3d_new.copy()
-
-                            # Fix 5: Extract yaw correction from Gemini
-                            yaw_delta_rad = np.deg2rad(float(explanation_json.get("suggested_yaw_delta_deg", 0.0)))
-
-                            # Reset to home (left corner) so every retry starts from the same position
-                            print("Retry Action Plan: Moving directly to hover...")
-
-                            print("Retry Action Plan: Hovering...")
-                            hover_pos = obj_pos.copy()
-                            hover_pos[2] += 0.2
-                            obs = step_towards(obs, hover_pos, gripper_action=-1, steps=10)
-
-                            # Fix 5: Rotate gripper in place at hover height before descending
-                            if abs(yaw_delta_rad) > 0.01:
-                                print(f"Retry Action Plan: Rotating gripper {np.rad2deg(yaw_delta_rad):.1f} deg...")
-                                obs = rotate_yaw_in_place(obs, yaw_delta_rad, gripper_action=-1, steps=20)
-
-                            print("Retry Action Plan: Lowering...")
-                            grasp_pos = obj_pos.copy()
-                            obs = step_towards(obs, grasp_pos, gripper_action=-1, steps=8)
-
-                            print("Retry Action Plan: Grasping...")
-                            obs = step_towards(obs, grasp_pos, gripper_action=1, steps=6, settle=True)
-                            last_contact_world = obs['robot0_eef_pos'].copy()
-
-                            print("Retry Action Plan: Lifting...")
-                            lift_pos = grasp_pos.copy()
-                            lift_pos[2] += 0.3
-                            obs = step_towards(obs, lift_pos, gripper_action=1, steps=10)
-
-                            lifted_any_chk, target_picked_chk, wrong_picked_chk = check_objects_lifted(env, target_obj_name)
-
-                            if target_picked_chk:
-                                print(f"\nOutcome: RECOVERY SUCCESS on Attempt {metrics['attempts']}")
-                                metrics["recovery_success"] = True
-                                metrics["task_success"] = True
-                                metrics["grasp_success"] = True
-                                break
-                            else:
-                                print(f"\nOutcome: RECOVERY FAILURE on Attempt {metrics['attempts']}")
-                                if lifted_any_chk:
-                                    metrics["wrong_object"] = True
-                                    metrics["grasp_success"] = True
-                        else:
-                            print(f"\nClosing feedback loop: Gemini did not suggest 'retry'.")
-                            break
-                    else:
-                        print("Gemini returned no JSON. Ending trial.")
-                        break
-                except Exception as e:
-                    print(f"Error in feedback loop: {e}")
-                    break
+                if target_ok:
+                    print(f"\nOutcome: RECOVERY SUCCESS on Attempt {metrics['attempts']}")
+                    metrics["recovery_success"] = True
+                    metrics["task_success"] = True
+                    metrics["grasp_success"] = True
+                else:
+                    print(f"\nOutcome: RECOVERY FAILURE on Attempt {metrics['attempts']}")
+                    if wrong_ok:
+                        metrics["wrong_object"] = True
+                        metrics["grasp_success"] = True
         
     if render_enabled and video_writer:
         video_writer.close()

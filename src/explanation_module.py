@@ -10,81 +10,102 @@ load_dotenv()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
 
-def encode_image_array_to_base64(img_array):
-    """Convert numpy array (RGB) to base64 jpeg."""
-    # Convert numpy array to PIL Image
-    image = Image.fromarray(img_array)
-    buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{img_str}"
+FAILURE_TAXONOMY = [
+    "wrong_object",
+    "no_object_reached",
+    "grasp_pose_bad",
+    "slip_after_contact",
+    "target_occluded",
+    "needs_yaw_adjustment",
+    "depth_plane_bad",
+    "abort_unrecoverable",
+]
 
-def analyze_failure(target_object, composite_img_array, last_grasp_u, last_grasp_v):
+GRASP_CHECKPOINTS = [
+    "target_identified",
+    "gripper_aligned_above_target",
+    "fingers_enclosing_target",
+    "object_lifted_clear_of_bin",
+    "correct_object_in_gripper",
+]
+
+
+def _encode_image(img_array):
+    image = Image.fromarray(img_array)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def classify_failure(target_object, frames):
     """
-    Sends a clean retracted composite Front+Bird view to Gemini 2.5 Flash.
-    last_grasp_u, last_grasp_v: pixel coords of the last commanded grasp target in the Front View,
-    used as an anchor so Gemini reports a signed delta instead of an absolute guess.
+    Stage 1: Classify a grasp failure using 5 sequential front-view frames.
+
+    frames: dict with numpy array values for keys:
+        'pre_hover'  - arm hovering above target, gripper open, before descent
+        'contact'    - gripper at grasp height, before closing
+        'post_close' - gripper closed, attempting to hold object
+        'post_lift'  - after lift attempt (failure becomes visible here)
+        'retracted'  - clean scene after arm fully retracted to home
+
+    Returns: {
+        'failure_type': str (one of FAILURE_TAXONOMY),
+        'failed_checkpoint': str (one of GRASP_CHECKPOINTS),
+        'explanation': str,
+        'confidence': float
+    } or None on error.
     """
     if not OPENROUTER_API_KEY:
-        print("Warning: OPENROUTER_API_KEY not found in environment variables.")
+        print("Warning: OPENROUTER_API_KEY not found.")
         return None
 
-    # Encode composite image
-    composite_b64 = encode_image_array_to_base64(composite_img_array)
+    taxonomy_str = "\n".join(f"  - {t}" for t in FAILURE_TAXONOMY)
+    checkpoint_str = "\n".join(f"  - {c}" for c in GRASP_CHECKPOINTS)
 
-    prompt = f"""You are a debugging assistant for a language-guided robotics system.
-The system was instructed to grab the: '{target_object}'.
+    prompt = f"""You are a robotics failure analyst. A robot arm attempted to pick up '{target_object}' and FAILED (the object was not successfully lifted).
 
-I am providing you with a FRONT VIEW image (512x512) captured after the robot arm has fully retracted out of the way.
+I am providing 5 consecutive front-view frames (512x512, red pixel-coordinate grid overlay) that capture the full grasp sequence:
 
-The robot's last grasp attempt made contact near pixel (u={last_grasp_u:.0f}, v={last_grasp_v:.0f}) in the Front View.
-A CYAN crosshair labeled LAST TARGET is drawn at that exact front-view contact point.
-For clarity, the LAST TARGET coordinates are:
-- LAST TARGET u = {last_grasp_u:.0f}
-- LAST TARGET v = {last_grasp_v:.0f}
-The gripper gizmo lines (visible in both views before retraction) were:
-- RED line: heading of the fingers.
-- GREEN line: the axis along which the gripper closes.
+  Frame 1 — PRE-HOVER: Arm at hover height above target, gripper open, before descent.
+  Frame 2 — CONTACT: Gripper lowered to grasp height, before closing.
+  Frame 3 — POST-CLOSE: Gripper has closed (attempting to hold object).
+  Frame 4 — POST-LIFT: After the lift attempt — this is where the failure is most visible.
+  Frame 5 — RETRACTED: Clean scene after arm fully retracted to home position.
 
-Your task:
-1. Locate the {target_object} center in the Front View (u 0-512).
-2. Compute delta_u = object_center_u - {last_grasp_u:.0f}  (positive = object is to the RIGHT of the last contact point).
-3. Compute delta_v = {last_grasp_v:.0f} - object_center_v  (positive = object is ABOVE the last contact point).
-4. If you cannot infer a useful yaw correction from the front view alone, set suggested_yaw_delta_deg to 0.
+STEP 1 — Checkpoint analysis.
+Examine the frames in sequence and determine the FIRST checkpoint that failed:
+{checkpoint_str}
 
-Provide a JSON response using EXACTLY this schema:
+STEP 2 — Failure classification.
+Based on the failed checkpoint, classify the failure into EXACTLY ONE of these types:
+{taxonomy_str}
+
+Definitions:
+  - wrong_object: The robot targeted or grasped a different object than '{target_object}'.
+  - no_object_reached: The gripper descended but clearly missed the object entirely (no meaningful contact).
+  - grasp_pose_bad: Gripper made contact but was off-center or poorly positioned for a stable grasp.
+  - slip_after_contact: Gripper appeared to hold the object (POST-CLOSE shows contact) but it slipped during lift.
+  - target_occluded: The target was not clearly visible in the scene, preventing reliable detection.
+  - needs_yaw_adjustment: Gripper contacted the object but its rotational orientation (yaw) was wrong for enclosure.
+  - depth_plane_bad: Gripper descended to the wrong depth (too shallow — barely touched, or too deep — pushed through).
+  - abort_unrecoverable: Object fell out of bin, severe scene disruption, or no single-retry fix exists.
+
+Respond with EXACTLY this JSON (no markdown, no extra keys):
 {{
-  "failure_type": "target occluded" | "grasp instability" | "wrong-object selection" | "no object reached",
-  "explanation": "<short natural language explanation of the failure>",
-  "suggested_action": "retry" | "abort",
-  "object_center_u": <float, absolute front-view u coordinate of the {target_object} center, 0-512>,
-  "object_center_v": <float, absolute front-view v coordinate of the {target_object} center, 0-512>,
-  "delta_u": <float, signed pixels to shift RIGHT from the last contact point ({last_grasp_u:.0f}) to object center>,
-  "delta_v": <float, signed pixels to shift UP from the last contact point ({last_grasp_v:.0f}) to object center>,
-  "suggested_yaw_delta_deg": <float, degrees to rotate gripper: positive=clockwise, negative=counterclockwise, 0 if no rotation needed>,
-  "confidence": <float from 0.0 to 1.0 for how certain you are about the target center>
-}}
+  "failed_checkpoint": "<one of the 5 checkpoints above>",
+  "failure_type": "<one of the 8 types above>",
+  "explanation": "<1-2 sentences describing what you observe across the frames>",
+  "confidence": <float 0.0 to 1.0>
+}}"""
 
-Important Instructions:
-- The image is 512x512 and shows only the Front View.
-- Use the red grid lines and labels (0, 32, 64, 96... 512) to measure pixel distances carefully.
-- The CYAN crosshair labeled LAST TARGET marks the exact previous front-view contact point.
-- delta_u and delta_v are RELATIVE offsets from that contact point ({last_grasp_u:.0f}, {last_grasp_v:.0f}), NOT absolute coordinates.
-- object_center_u and object_center_v must be the absolute front-view center coordinates of the {target_object}.
-- Positive delta_u means move RIGHT in the image. Negative delta_u means move LEFT in the image.
-- Example: if LAST TARGET is at u=170 and the object center is at u=210, then delta_u = 210 - 170 = +40, which means 40 pixels RIGHT.
-- Example: if LAST TARGET is at u=170 and the object center is at u=150, then delta_u = 150 - 170 = -20, which means 20 pixels LEFT.
-- Positive delta_v means move UP in the image. Negative delta_v means move DOWN in the image.
-- Example: if LAST TARGET is at v=260 and the object center is at v=230, then delta_v = 260 - 230 = +30, which means 30 pixels UP.
-- Example: if LAST TARGET is at v=260 and the object center is at v=290, then delta_v = 260 - 290 = -30, which means 30 pixels DOWN.
-- If delta_v is negative, the target is BELOW the cyan LAST TARGET point, so move DOWN.
-- Only use the Front View for localization.
-- VISUAL CUES for {target_object}:
-  * Milk: White/red carton.
-  * Cereal: Red box. The red box in the scene is the cereal box.
-  * Bread: Tan loaf box.
-  * Can: Red cylinder.
-"""
+    frame_order = ["pre_hover", "contact", "post_close", "post_lift", "retracted"]
+    frame_labels = ["PRE-HOVER", "CONTACT", "POST-CLOSE", "POST-LIFT", "RETRACTED"]
+
+    content = [{"type": "text", "text": prompt}]
+    for i, (key, label) in enumerate(zip(frame_order, frame_labels)):
+        if key in frames and frames[key] is not None:
+            content.append({"type": "text", "text": f"Frame {i + 1} — {label}:"})
+            content.append({"type": "image_url", "image_url": {"url": _encode_image(frames[key])}})
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -92,27 +113,10 @@ Important Instructions:
         "HTTP-Referer": "http://localhost:8000",
         "X-Title": "SimRobotics",
     }
-
     payload = {
         "model": OPENROUTER_MODEL,
         "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": composite_b64
-                        }
-                    }
-                ]
-            }
-        ]
+        "messages": [{"role": "user", "content": content}],
     }
 
     try:
@@ -120,36 +124,19 @@ Important Instructions:
             url="https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=30
+            timeout=60,
         )
         response.raise_for_status()
-        result = response.json()
-        content = result['choices'][0]['message']['content']
-        
-        # Parse JSON
-        data = json.loads(content)
+        data = json.loads(response.json()["choices"][0]["message"]["content"])
+        if data.get("failure_type") not in FAILURE_TAXONOMY:
+            data["failure_type"] = "abort_unrecoverable"
+        if data.get("failed_checkpoint") not in GRASP_CHECKPOINTS:
+            data["failed_checkpoint"] = "unknown"
         return data
-
     except Exception as e:
-        print(f"Error querying OpenRouter API: {e}")
+        print(f"Error querying Gemini: {e}")
         try:
             print(response.text)
-        except:
+        except Exception:
             pass
         return None
-
-if __name__ == "__main__":
-    print("Testing Explanation Module Standalone...")
-    import numpy as np
-
-    # Check if a test image exists
-    test_image_path = "test_frontview.png"
-    if os.path.exists(test_image_path):
-        print(f"Found {test_image_path}. Using it as test image.")
-        test_img = np.array(Image.open(test_image_path))
-
-        print("Sending request to Gemini...")
-        result = analyze_failure("Milk", test_img, last_grasp_u=256.0, last_grasp_v=256.0)
-        print(json.dumps(result, indent=2))
-    else:
-        print("No test_frontview.png found. Run baseline.py to generate simulation files.")
