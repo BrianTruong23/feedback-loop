@@ -120,15 +120,19 @@ Every simulation run generates a timestamped directory in `runs/`:
    ```bash
    python eval/test_evaluate.py
    ```
-5. **Standalone Plotting** (from existing `metrics/results.json`):
+5. **Failgen Benchmark** (scripted labeled failures + alignment summary):
+   ```bash
+   python3 eval/failgen_benchmark.py
+   ```
+6. **Standalone Plotting** (from existing `metrics/results.json`):
    ```bash
    python eval/plot_metrics.py
    ```
-6. **Single Run** (direct baseline execution):
+7. **Single Run** (direct baseline execution):
    ```bash
    python3 -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback')"
    ```
-7. **Dynamic Retry Budget**:
+8. **Dynamic Retry Budget**:
    ```bash
    python3 -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback_6')"
    ```

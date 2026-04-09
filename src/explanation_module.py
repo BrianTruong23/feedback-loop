@@ -29,12 +29,64 @@ GRASP_CHECKPOINTS = [
     "correct_object_in_gripper",
 ]
 
+OBJECT_TASK_DESCRIPTORS = {
+    "Milk": {
+        "noun": "milk carton",
+        "alignment_target": "the milk carton center",
+        "straddle_target": "the milk carton side faces",
+        "closure_target": "the milk carton side faces",
+        "lift_target": "the milk carton",
+    },
+    "Bread": {
+        "noun": "bread loaf box",
+        "alignment_target": "the bread loaf box center",
+        "straddle_target": "the bread loaf box side faces",
+        "closure_target": "the bread loaf box side faces",
+        "lift_target": "the bread loaf box",
+    },
+    "Cereal": {
+        "noun": "cereal box",
+        "alignment_target": "the cereal box center",
+        "straddle_target": "the cereal box side faces",
+        "closure_target": "the cereal box side faces",
+        "lift_target": "the cereal box",
+    },
+    "Can": {
+        "noun": "soda can",
+        "alignment_target": "the soda can center",
+        "straddle_target": "the soda can left and right sides",
+        "closure_target": "the soda can curved side faces",
+        "lift_target": "the soda can",
+    },
+}
+
 
 def _encode_image(img_array):
     image = Image.fromarray(img_array)
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=85)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _build_object_specific_subtasks(target_object):
+    spec = OBJECT_TASK_DESCRIPTORS.get(
+        target_object,
+        {
+            "noun": target_object.lower(),
+            "alignment_target": f"the {target_object.lower()} center",
+            "straddle_target": f"the {target_object.lower()} sides",
+            "closure_target": f"the {target_object.lower()} side faces",
+            "lift_target": f"the {target_object.lower()}",
+        },
+    )
+    return "\n".join(
+        [
+            f"  - subtask_1: align gripper above {spec['alignment_target']}",
+            f"  - subtask_2: descend so fingers straddle {spec['straddle_target']}",
+            f"  - subtask_3: close gripper around {spec['closure_target']}",
+            f"  - subtask_4: lift {spec['lift_target']} clear of bin",
+        ]
+    )
 
 
 def classify_failure(target_object, frames):
@@ -61,6 +113,7 @@ def classify_failure(target_object, frames):
 
     taxonomy_str = "\n".join(f"  - {t}" for t in FAILURE_TAXONOMY)
     checkpoint_str = "\n".join(f"  - {c}" for c in GRASP_CHECKPOINTS)
+    object_specific_subtasks = _build_object_specific_subtasks(target_object)
 
     prompt = f"""You are a robotics failure analyst. A robot arm attempted to pick up '{target_object}' and FAILED (the object was not successfully lifted).
 
@@ -72,8 +125,11 @@ I am providing 5 consecutive front-view frames (512x512, red pixel-coordinate gr
   Frame 4 — POST-LIFT: After the lift attempt — this is where the failure is most visible.
   Frame 5 — RETRACTED: Clean scene after arm fully retracted to home position.
 
+Reason about the attempt through these object-specific sub-tasks:
+{object_specific_subtasks}
+
 STEP 1 — Checkpoint analysis.
-Examine the frames in sequence and determine the FIRST checkpoint that failed:
+Examine the frames in sequence and determine the FIRST checkpoint that failed. Use the object-specific sub-tasks above to ground your decision:
 {checkpoint_str}
 
 STEP 2 — Failure classification.
