@@ -19,17 +19,26 @@ POS_TOL = 0.005
 MAX_YAW_ACTION = 0.18
 YAW_TOL = np.deg2rad(1.5)
 DEFAULT_GRIPPER_YAW_DEG = -45.0
+# Side observation pose used before re-detecting when the target is classified as occluded.
 OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
 # Slip recovery depth is a tradeoff:
 # more negative makes the retry descend deeper, which can improve enclosure,
 # but if it is too low the gripper tends to hit or knock over the cereal box
 # and the policy stops making useful progress. If it is not negative enough,
 # the grasp stays too shallow and the box often slips during lift.
-SLIP_RECOVERY_Z_OFFSET_M = -0.2
+SLIP_RECOVERY_Z_OFFSET_M = -0.22
+# Number of closed-gripper hold steps after descending on a slip-recovery retry.
+SLIP_RECOVERY_SETTLE_STEPS = 17
+# Height above the grasp target that the robot moves to before descending.
+GRASP_HOVER_Z_OFFSET_M = 0.08
+# Upward distance commanded after closing the gripper to test / complete the lift.
+GRASP_LIFT_Z_OFFSET_M = 0.35
 
-SLIP_RECOVERY_SETTLE_STEPS = 16
-GRASP_HOVER_Z_OFFSET_M = 0.12
-GRASP_LIFT_Z_OFFSET_M = 0.3
+# version worked
+# SLIP_RECOVERY_Z_OFFSET_M = -0.22
+# SLIP_RECOVERY_SETTLE_STEPS = 16
+# GRASP_HOVER_Z_OFFSET_M = 0.1
+# GRASP_LIFT_Z_OFFSET_M = 0.3
 
 
 def simplify_environment(env):
@@ -177,7 +186,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     # Always create a timestamped run directory for artifacts and video.
     # Set BASELINE_RENDER=0 to disable video recording (frames + logs still saved).
     import imageio
-    timestamp = datetime.datetime.now().strftime("%m%d_%I_%M_%p").lower()
+    timestamp = datetime.datetime.now().strftime("%m%d_%I_%M_%S_%p").lower()
     run_name = f"run_{condition}_trial_{trial_idx}_{timestamp}"
     run_dir = os.path.join("runs", run_name)
     os.makedirs(run_dir, exist_ok=True)
