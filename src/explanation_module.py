@@ -132,6 +132,7 @@ Respond with EXACTLY this JSON (no markdown, no extra keys):
             data["failure_type"] = "abort_unrecoverable"
         if data.get("failed_checkpoint") not in GRASP_CHECKPOINTS:
             data["failed_checkpoint"] = "unknown"
+        data["prompt_text"] = prompt  # expose for run-log saving
         return data
     except Exception as e:
         print(f"Error querying Gemini: {e}")

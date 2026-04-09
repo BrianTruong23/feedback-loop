@@ -125,21 +125,22 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
     # 2. Environment Setup
     print("Initializing Robosuite 'PickPlace' environment with Panda arm...")
-    render_enabled = os.environ.get("BASELINE_RENDER", "0") == "1"
     IMG_H, IMG_W = 512, 512
+
+    # Always create a timestamped run directory for artifacts and video.
+    # Set BASELINE_RENDER=0 to disable video recording (frames + logs still saved).
+    import imageio
+    timestamp = datetime.datetime.now().strftime("%m%d_%I_%M_%p").lower()
+    run_name = f"run_{condition}_trial_{trial_idx}_{timestamp}"
+    run_dir = os.path.join("runs", run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Run artifacts → {run_dir}")
+
+    video_enabled = os.environ.get("BASELINE_RENDER", "1") != "0"
     video_writer = None
-    vid_path = None
-    current_vid_path = None
-    if render_enabled:
-        timestamp = datetime.datetime.now().strftime("%m%d_%I_%M_%p").lower()
-        run_name = f"run_{condition}_trial_{trial_idx}_{timestamp}"
-        run_dir = os.path.join("runs", run_name)
-        os.makedirs(run_dir, exist_ok=True)
-        vid_path = os.path.join(run_dir, "attempt_1_run.mp4")
-        
-        print(f"Rendering requested. Generating video '{vid_path}'...")
-        import imageio
-        video_writer = imageio.get_writer(vid_path, fps=20)
+    current_vid_path = os.path.join(run_dir, "attempt_1.mp4")
+    if video_enabled:
+        video_writer = imageio.get_writer(current_vid_path, fps=20)
 
     # The default PickPlaceSingle loads a Single Object, PickPlace loads 4 (Milk, Bread, Cereal, Can)
     # We will use PickPlace to have clutter.
@@ -179,14 +180,14 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             action[:3] = np.clip(delta * POS_GAIN, -MAX_CART_ACTION * speed_scale, MAX_CART_ACTION * speed_scale)
             action[6] = gripper_action
             current_obs, reward, done, info = env.step(action)
-            if render_enabled and video_writer:
+            if video_enabled and video_writer:
                 video_writer.append_data(current_obs["frontview_image"][::-1])
 
         if settle:
             settle_action = np.zeros(7)
             settle_action[6] = gripper_action
             current_obs, reward, done, info = env.step(settle_action)
-            if render_enabled and video_writer:
+            if video_enabled and video_writer:
                 video_writer.append_data(current_obs["frontview_image"][::-1])
         return current_obs
 
@@ -204,7 +205,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             action[6] = gripper_action
             current_obs, _, _, _ = env.step(action)
             remaining -= action[5]
-            if render_enabled and video_writer:
+            if video_enabled and video_writer:
                 video_writer.append_data(current_obs["frontview_image"][::-1])
 
         return current_obs
@@ -220,13 +221,12 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     retract_pos = np.array([0.4, -0.6, 1.4])
     obs = step_towards(obs, retract_pos, gripper_action=-1, steps=12)
     owlvit_frontview = create_frontview_image(obs, env)
-    if render_enabled and run_dir:
-        try:
-            Image.fromarray(owlvit_frontview).save(os.path.join(run_dir, "owlvit_clear_view.png"))
-        except Exception:
-            pass
+    try:
+        Image.fromarray(owlvit_frontview).save(os.path.join(run_dir, "owlvit_clear_view.png"))
+    except Exception:
+        pass
     
-    if render_enabled and video_writer:
+    if video_enabled and video_writer:
         video_writer.append_data(obs["frontview_image"][::-1])
     
     # Simulate VLM picking out the target from the language instruction
@@ -265,7 +265,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     if len(results[0]["scores"]) == 0:
         print("Failure Reasoning: 'target occluded' / not found")
         print("Explanation: OWL-ViT could not visually detect the object in the camera view.")
-        if render_enabled and video_writer: video_writer.close()
+        if video_enabled and video_writer: video_writer.close()
         return False
         
     # Get the highest scoring box
@@ -370,12 +370,16 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             obs = step_towards(obs, HOME_POS, gripper_action=-1, steps=10)
             frames["retracted"] = create_frontview_image(obs, env)
 
-            if render_enabled and run_dir:
-                try:
-                    for fname, frame in frames.items():
-                        Image.fromarray(frame).save(os.path.join(run_dir, f"frame_{fname}.png"))
-                except Exception:
-                    pass
+            # Always save the 5 evidence frames with numbered names
+            FRAME_ORDER = ["pre_hover", "contact", "post_close", "post_lift", "retracted"]
+            for i, fname in enumerate(FRAME_ORDER):
+                if fname in frames:
+                    try:
+                        Image.fromarray(frames[fname]).save(
+                            os.path.join(run_dir, f"frame_{i+1:02d}_{fname}.png")
+                        )
+                    except Exception:
+                        pass
 
             # --- Stage 1: Classify failure from 5 temporal frames ---
             # VLM reasons over the full grasp sequence; it does NOT provide pixel corrections.
@@ -400,13 +404,16 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 metrics["failure_type"] = failure_type
                 metrics["explanation"] = failure_result["explanation"]
 
-                if render_enabled and run_dir:
-                    try:
-                        import json
-                        with open(os.path.join(run_dir, "failure_classification.json"), "w") as f:
-                            json.dump(failure_result, f, indent=2)
-                    except Exception:
-                        pass
+                # Save Gemini prompt text and classification result
+                import json as _json
+                try:
+                    with open(os.path.join(run_dir, "gemini_prompt.txt"), "w") as f:
+                        f.write(failure_result.get("prompt_text", ""))
+                    log = {k: v for k, v in failure_result.items() if k != "prompt_text"}
+                    with open(os.path.join(run_dir, "failure_classification.json"), "w") as f:
+                        _json.dump(log, f, indent=2)
+                except Exception:
+                    pass
 
                 # --- Stage 2: Programmatic recovery policies ---
                 # OWL-ViT remains the primary localizer. VLM only identified the failure type.
@@ -472,41 +479,54 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 metrics["attempts"] += 1
                 print(f"\n--- RECOVERY ATTEMPT {metrics['attempts']} | policy={failure_type} ---")
 
+                recovery_log = {
+                    "failure_type": failure_type,
+                    "failed_checkpoint": failed_checkpoint,
+                    "policy": None,
+                    "parameters": {},
+                    "outcome": None,
+                }
+
                 if failure_type in ("wrong_object", "no_object_reached", "target_occluded"):
-                    # Re-detect with OWL-ViT; use disambiguation prompt for wrong-object case
-                    obs, target_ok, wrong_ok = redetect_and_grasp(
-                        obs, disambiguation=(failure_type == "wrong_object")
-                    )
+                    disambiguation = failure_type == "wrong_object"
+                    recovery_log["policy"] = "redetect_owlvit"
+                    recovery_log["parameters"] = {"disambiguation": disambiguation}
+                    obs, target_ok, wrong_ok = redetect_and_grasp(obs, disambiguation=disambiguation)
 
                 elif failure_type in ("grasp_pose_bad", "needs_yaw_adjustment"):
-                    # Rotate yaw and re-approach same XY target
                     yaw = 90.0 if failure_type == "needs_yaw_adjustment" else 45.0
+                    recovery_log["policy"] = "yaw_rotation"
+                    recovery_log["parameters"] = {"yaw_deg": yaw, "target_pos": obj_pos.tolist()}
                     obs, target_ok, wrong_ok = do_grasp(obs, obj_pos, pre_yaw_deg=yaw)
 
                 elif failure_type == "slip_after_contact":
-                    # Grab 1 cm lower on the object; increase gripper settle time
                     slip_pos = obj_pos.copy()
                     slip_pos[2] -= 0.01
+                    recovery_log["policy"] = "lower_grasp_more_settle"
+                    recovery_log["parameters"] = {"z_offset_m": -0.01, "settle_steps": 12,
+                                                   "target_pos": slip_pos.tolist()}
                     obs, target_ok, wrong_ok = do_grasp(obs, slip_pos, settle_steps=12)
 
                 elif failure_type == "depth_plane_bad":
-                    # Descend 2 cm deeper than the initial Z estimate
                     adj_pos = obj_pos.copy()
                     adj_pos[2] -= 0.02
+                    recovery_log["policy"] = "adjust_depth"
+                    recovery_log["parameters"] = {"z_offset_m": -0.02, "target_pos": adj_pos.tolist()}
                     obs, target_ok, wrong_ok = do_grasp(obs, adj_pos)
 
                 else:  # abort_unrecoverable
                     print("  Recovery: abort_unrecoverable — no retry possible.")
+                    recovery_log["policy"] = "abort"
                     target_ok, wrong_ok = False, False
 
-                if render_enabled and video_writer is not None:
+                # Roll video to a new file for the recovery attempt
+                if video_enabled and video_writer is not None:
                     try:
                         video_writer.close()
                     except Exception:
                         pass
-                    current_vid_path = os.path.join(run_dir, f"attempt_{metrics['attempts']}_run.mp4")
+                    current_vid_path = os.path.join(run_dir, f"attempt_{metrics['attempts']}.mp4")
                     try:
-                        import imageio
                         video_writer = imageio.get_writer(current_vid_path, fps=20)
                     except Exception:
                         pass
@@ -516,19 +536,42 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                     metrics["recovery_success"] = True
                     metrics["task_success"] = True
                     metrics["grasp_success"] = True
+                    recovery_log["outcome"] = "success"
                 else:
                     print(f"\nOutcome: RECOVERY FAILURE on Attempt {metrics['attempts']}")
+                    recovery_log["outcome"] = "failure"
                     if wrong_ok:
                         metrics["wrong_object"] = True
                         metrics["grasp_success"] = True
+
+                try:
+                    with open(os.path.join(run_dir, "recovery_action.json"), "w") as f:
+                        _json.dump(recovery_log, f, indent=2)
+                except Exception:
+                    pass
         
-    if render_enabled and video_writer:
+    if video_enabled and video_writer:
         video_writer.close()
-        print(f"Final video saved to '{current_vid_path if current_vid_path else vid_path}'.")
-        
+        print(f"Video saved → {current_vid_path}")
+
     env.close()
     metrics["latency"] = time.time() - start_time
-    
+
+    # Always write a trial summary so every run has a complete record
+    try:
+        import json as _json
+        with open(os.path.join(run_dir, "trial_summary.json"), "w") as f:
+            _json.dump({
+                "condition": condition,
+                "instruction": instruction,
+                "trial_idx": trial_idx,
+                "run_dir": run_dir,
+                **metrics,
+            }, f, indent=2)
+        print(f"Trial summary → {os.path.join(run_dir, 'trial_summary.json')}")
+    except Exception:
+        pass
+
     return metrics
 
 if __name__ == "__main__":
