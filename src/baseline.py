@@ -20,9 +20,9 @@ MAX_YAW_ACTION = 0.18
 YAW_TOL = np.deg2rad(1.5)
 DEFAULT_GRIPPER_YAW_DEG = -45.0
 OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
-SLIP_RECOVERY_Z_OFFSET_M = -0.01
-SLIP_RECOVERY_SETTLE_STEPS = 12
-GRASP_HOVER_Z_OFFSET_M = 0.2
+SLIP_RECOVERY_Z_OFFSET_M = -0.22
+SLIP_RECOVERY_SETTLE_STEPS = 16
+GRASP_HOVER_Z_OFFSET_M = 0.14
 GRASP_LIFT_Z_OFFSET_M = 0.3
 
 def simplify_environment(env):
@@ -129,6 +129,9 @@ def get_max_attempts_for_condition(condition):
     if match:
         return max(1, int(match.group(1)))
     return 1
+
+def failure_type_implies_grasp_success(failure_type):
+    return failure_type == "slip_after_contact"
 
 def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
     print(f"\n--- Starting Trial {trial_idx} | Condition: {condition} ---")
@@ -579,6 +582,8 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 metrics["failure_type"] = failure_type
                 metrics["failed_checkpoint"] = failed_checkpoint
                 metrics["explanation"] = failure_result["explanation"]
+                if failure_type_implies_grasp_success(failure_type):
+                    metrics["grasp_success"] = True
 
                 try:
                     with open(os.path.join(attempt_dir, "gemini_prompt.txt"), "w") as f:
