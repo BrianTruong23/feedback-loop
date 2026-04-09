@@ -136,6 +136,11 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     os.makedirs(run_dir, exist_ok=True)
     print(f"Run artifacts → {run_dir}")
 
+    def get_attempt_dir(attempt_num):
+        attempt_dir = os.path.join(run_dir, f"attempt_{attempt_num}")
+        os.makedirs(attempt_dir, exist_ok=True)
+        return attempt_dir
+
     video_enabled = os.environ.get("BASELINE_RENDER", "1") != "0"
     video_writer = None
     current_vid_path = os.path.join(run_dir, "attempt_1.mp4")
@@ -372,11 +377,15 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
             # Always save the 5 evidence frames with numbered names
             FRAME_ORDER = ["pre_hover", "contact", "post_close", "post_lift", "retracted"]
+            attempt_num = metrics["attempts"]
+            attempt_dir = get_attempt_dir(attempt_num)
+            frames_dir = os.path.join(attempt_dir, "gemini_frames")
+            os.makedirs(frames_dir, exist_ok=True)
             for i, fname in enumerate(FRAME_ORDER):
                 if fname in frames:
                     try:
                         Image.fromarray(frames[fname]).save(
-                            os.path.join(run_dir, f"frame_{i+1:02d}_{fname}.png")
+                            os.path.join(frames_dir, f"frame_{i+1:02d}_{fname}.png")
                         )
                     except Exception:
                         pass
@@ -407,10 +416,10 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 # Save Gemini prompt text and classification result
                 import json as _json
                 try:
-                    with open(os.path.join(run_dir, "gemini_prompt.txt"), "w") as f:
+                    with open(os.path.join(attempt_dir, "gemini_prompt.txt"), "w") as f:
                         f.write(failure_result.get("prompt_text", ""))
                     log = {k: v for k, v in failure_result.items() if k != "prompt_text"}
-                    with open(os.path.join(run_dir, "failure_classification.json"), "w") as f:
+                    with open(os.path.join(attempt_dir, "failure_classification.json"), "w") as f:
                         _json.dump(log, f, indent=2)
                 except Exception:
                     pass
@@ -545,7 +554,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                         metrics["grasp_success"] = True
 
                 try:
-                    with open(os.path.join(run_dir, "recovery_action.json"), "w") as f:
+                    with open(os.path.join(attempt_dir, "recovery_action.json"), "w") as f:
                         _json.dump(recovery_log, f, indent=2)
                 except Exception:
                     pass
