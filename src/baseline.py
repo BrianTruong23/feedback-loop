@@ -479,6 +479,18 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 metrics["attempts"] += 1
                 print(f"\n--- RECOVERY ATTEMPT {metrics['attempts']} | policy={failure_type} ---")
 
+                # Roll video BEFORE the recovery grasp so frames land in the correct file
+                if video_enabled and video_writer is not None:
+                    try:
+                        video_writer.close()
+                    except Exception:
+                        pass
+                    current_vid_path = os.path.join(run_dir, f"attempt_{metrics['attempts']}.mp4")
+                    try:
+                        video_writer = imageio.get_writer(current_vid_path, fps=20)
+                    except Exception:
+                        pass
+
                 recovery_log = {
                     "failure_type": failure_type,
                     "failed_checkpoint": failed_checkpoint,
@@ -518,18 +530,6 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                     print("  Recovery: abort_unrecoverable — no retry possible.")
                     recovery_log["policy"] = "abort"
                     target_ok, wrong_ok = False, False
-
-                # Roll video to a new file for the recovery attempt
-                if video_enabled and video_writer is not None:
-                    try:
-                        video_writer.close()
-                    except Exception:
-                        pass
-                    current_vid_path = os.path.join(run_dir, f"attempt_{metrics['attempts']}.mp4")
-                    try:
-                        video_writer = imageio.get_writer(current_vid_path, fps=20)
-                    except Exception:
-                        pass
 
                 if target_ok:
                     print(f"\nOutcome: RECOVERY SUCCESS on Attempt {metrics['attempts']}")
