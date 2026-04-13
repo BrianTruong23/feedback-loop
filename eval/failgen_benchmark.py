@@ -52,7 +52,7 @@ def plot_failgen_confusion(results, output_path):
     plt.close()
 
 
-def run_failgen_benchmark(condition="feedback", trials_per_case=1):
+def run_failgen_benchmark(condition="feedback_1", trials_per_case=1):
     os.environ["BASELINE_RENDER"] = "1"
     os.makedirs("metrics", exist_ok=True)
 

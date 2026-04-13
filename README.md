@@ -40,9 +40,11 @@ robotics-project/
 │   └── manual_grasp.py          # Interactive coordinate grasp tester
 │
 ├── eval/                        # Evaluation harness
-│   ├── evaluate.py              # Full evaluation (5 trials × 4 conditions)
+│   ├── evaluate.py              # Full evaluation (10 trials × 4 conditions; skips if run_* exists)
+│   ├── condition_utils.py       # Condition names, legacy aliases, merge order for plots
+│   ├── metrics_plots.py         # Shared plot_all_metrics() (no sim import; used by evaluate + plot_metrics)
 │   ├── test_evaluate.py         # Quick single-trial debug evaluation
-│   └── plot_metrics.py          # Standalone plot generator from results.json
+│   └── plot_metrics.py          # Regenerate all PNGs from metrics/results.json
 │
 ├── tests/                       # Unit & integration tests
 │   ├── test_depth.py            # Depth map tests
@@ -61,6 +63,7 @@ robotics-project/
 ├── requirements.txt
 ├── context.md                   # Codebase context for AI agents
 ├── proposal.md                  # Research proposal
+├── read_for_details.md          # Experiment details + snapshot metrics from evaluation runs
 └── .env                         # API keys (gitignored)
 ```
 
@@ -86,7 +89,7 @@ robotics-project/
 ### 3. Recovery Policy Layer (`src/baseline.py`)
 
 - **Policy Selection from Failure Type**: Recovery primitives are selected programmatically from Gemini's `failure_type`.
-- **Dynamic Retry Budgets**: Conditions like `feedback`, `feedback_double`, and `feedback_6` map to different maximum attempt counts.
+- **Dynamic retry budgets**: `feedback_N` means **N** Gemini failure-classification calls (each after a failed grasp, before the next recovery grasp). Total grasp attempts = **N + 1** (one initial grasp plus up to **N** recovery grasps). Legacy aliases: `feedback` → `feedback_1`, `feedback_double` → `feedback_2`.
 - **Stateful Retrying**: After each non-abort recovery attempt, the believed target position is updated so later retries start from the most recent hypothesis.
 
 ### 4. Control & Grasping Heuristics
@@ -98,25 +101,33 @@ robotics-project/
 
 ## 📊 Evaluation Harness
 
-The system supports a multi-condition experimental framework (`eval/evaluate.py`):
+The system supports a multi-condition experimental framework (`eval/evaluate.py`). Default schedule: **`baseline`**, **`feedback_1`**, **`feedback_2`**, **`feedback_3`** (10 trials each → **40** runs total unless slots are skipped).
 
+| Condition | Description | Gemini rounds | Max grasp attempts |
+| --------- | ----------- | ------------- | ------------------ |
+| **baseline** | Single grasp; no failure-classification or recovery loop | 0 | 1 |
+| **explanation_only** | One grasp; Gemini failure analysis only, then stop (no recovery grasp) | 0–1 (analysis only) | 1 |
+| **feedback_N** | After each failed grasp, Gemini classifies failure → recovery → retry, up to **N** such rounds | **N** | **N + 1** |
+| **feedback_1** (alias `feedback`) | Same as **feedback_N** with **N = 1** | 1 | 2 |
+| **feedback_2** (alias `feedback_double`) | Same as **feedback_N** with **N = 2** | 2 | 3 |
+| **feedback_3** | Same as **feedback_N** with **N = 3** | 3 | 4 |
 
-| Condition            | Description                                                            | Retries           |
-| -------------------- | ---------------------------------------------------------------------- | ----------------- |
-| **Baseline**         | Standard open-loop attempt                                             | 0                 |
-| **Explanation Only** | Temporal failure analysis only, no recovery action                     | 0 (analyzes only) |
-| **Feedback**         | One recovery attempt after temporal failure classification             | 1 retry           |
-| **Double Feedback**  | Two sequential recovery attempts after temporal failure classification | 2 retries         |
-| **Feedback_N**       | Dynamic retry budget where `N` is the total attempt count              | `N-1` retries     |
+**Skip / resume:** For each `(condition, trial_index)`, if `runs/run_<condition>_trial_<k>_*/` already exists with a readable `trial_summary.json`, that slot is **not** re-simulated; metrics are reloaded. Legacy folder names (`run_feedback_*`, `run_feedback_double_*`) still match **`feedback_1`** / **`feedback_2`**.
 
+**Plots:** `plot_all_metrics` in `eval/metrics_plots.py` merges the default schedule with **every** condition present in `metrics/results.json` so no rows are dropped (e.g. **`feedback_3`** always appears when present). `python eval/plot_metrics.py` uses the same code path as the end of `eval/evaluate.py`.
 
-### Generated Plots
+### Generated plots
 
-- `metrics/success_rates.png` — Grouped bar chart of outcome rates
-- `metrics/latency_plot.png` — Box plot of time-to-completion
-- `metrics/attempts_plot.png` — Average attempts per condition
-- `metrics/failure_types_pie.png` — Pie chart of failure type distribution
-- `metrics/failed_checkpoints_pie.png` — Pie chart of the first failed grasp checkpoint
+- `metrics/success_rates.png` — Grouped bar chart: **task success**, **grasp success**, **recovery success** (wrong-object rate is **not** shown; default task uses a **single** target object so that metric is omitted from the chart)
+- `metrics/latency_plot.png` — Box plot of **total** episode time (higher `feedback_N` often uses more grasps by design — compare with `latency_per_attempt.png` for a fairer time comparison)
+- `metrics/attempts_plot.png` — Distribution of grasp attempts per condition (expected to differ when `N` differs — see `outcome_by_final_attempt.png` for a budget-fair view)
+- `metrics/latency_per_attempt.png` — **Latency ÷ attempts** per trial (box plot): approximates mean wall-clock time **per grasp**, so conditions with more attempts are not automatically “slower”
+- `metrics/outcome_by_final_attempt.png` — **100% stacked bars**: share of trials that **failed**, or succeeded on the **1st / 2nd / 3rd / 4th+** grasp (does not penalize deeper feedback for using retries)
+- `metrics/latency_on_success_only.png` — Mean **total** latency **among successful trials only** (compare time-to-success without averaging in failed short episodes)
+- `metrics/failure_types_pie.png` — Pie chart of failure type distribution (when recorded)
+- `metrics/failed_checkpoints_pie.png` — Pie chart of first failed grasp checkpoint (when recorded)
+
+**Further detail:** See **`read_for_details.md`** for a full experiment write-up and **snapshot numbers** derived from the latest `metrics/results.json`.
 
 ---
 
@@ -163,9 +174,9 @@ Every simulation run generates a timestamped directory in `runs/`:
    **Full run, but no Gemini on failure:** `BASELINE_SKIP_GEMINI=1` keeps OWL-ViT and grasp in the video; only the failure-classification API call is skipped.
 
    **Full evaluation but skip Gemini on grasp failure:** set `BASELINE_SKIP_GEMINI=1`, or `python eval/run_single_trial.py --skip-gemini`.
-4. **Full Evaluation** (5 trials × 4 conditions = 20 runs):
+4. **Full Evaluation** (10 trials × 4 conditions: `baseline`, `feedback_1`, `feedback_2`, `feedback_3`). If `runs/run_<condition>_trial_<k>_*/` already exists with `trial_summary.json`, that slot is skipped and metrics are reloaded.
   ```bash
-   python eval/evaluate.py
+   python3 eval/evaluate.py
   ```
 5. **Quick Debug** (1 trial per condition):
   ```bash
@@ -177,7 +188,7 @@ Every simulation run generates a timestamped directory in `runs/`:
   ```
 7. **Single Run** (direct baseline execution):
   ```bash
-   python3 -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback')"
+   python3 -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback_1')"
   ```
 8. **Dynamic Retry Budget**:
   ```bash

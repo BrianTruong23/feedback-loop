@@ -16,7 +16,7 @@ from src.baseline import run_baseline
 os.environ["BASELINE_RENDER"] = "1"
 
 def test_evaluate():
-    conditions = ["baseline", "explanation_only", "feedback", "feedback_double"]
+    conditions = ["baseline", "explanation_only", "feedback_1", "feedback_2"]
     n_trials = 1  # Single trial per condition for quick debugging
 
     target_text = "pick the cereal"

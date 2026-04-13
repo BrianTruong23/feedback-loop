@@ -344,13 +344,26 @@ OWL_DETECTION_VIDEO_HOLD_FRAMES = 20
 
 
 def get_max_attempts_for_condition(condition):
-    if condition == "feedback":
+    """
+    Maximum total grasp attempts (attempt 1 = initial; higher = recovery grasps).
+
+    **feedback_N** means **N** Gemini failure-classification calls (after N failed grasps,
+    each followed by a recovery policy before the next grasp). Total grasps = **N + 1**
+    (one initial + up to N grasps after each Gemini round).
+
+    Legacy aliases: ``feedback`` → ``feedback_1``; ``feedback_double`` → ``feedback_2``.
+    """
+    c = (condition or "").strip().lower()
+    if c in ("baseline", "explanation_only"):
+        return 1
+    if c in ("feedback", "feedback_1"):
         return 2
-    if condition == "feedback_double":
+    if c in ("feedback_double", "feedback_2"):
         return 3
-    match = re.fullmatch(r"feedback_(\d+)", condition or "")
+    match = re.fullmatch(r"feedback_(\d+)", c)
     if match:
-        return max(1, int(match.group(1)))
+        n = int(match.group(1))
+        return max(1, n + 1)
     return 1
 
 def failure_type_implies_grasp_success(failure_type):
@@ -373,7 +386,7 @@ def instruction_to_target_object_name(instruction):
     return None
 
 
-def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
+def run_baseline(instruction="pick the milk", condition="feedback_1", trial_idx=0, seed=None, processor=None, model=None, device=None):
     # Normalize so "Feedback", " feedback ", etc. still enable recovery; must match get_max_attempts_for_condition.
     if condition is not None:
         condition = str(condition).strip().lower()
@@ -396,9 +409,12 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         "explanation": ""
     }
     max_attempts = get_max_attempts_for_condition(condition)
+    _gemini_rounds = max(0, max_attempts - 1) if (condition or "").startswith("feedback") else 0
     print(
-        f"Max grasp attempts (initial + retries) for this condition: {max_attempts}. "
-        f"Use condition='feedback' or 'feedback_3' for retries; 'feedback_1' or 'baseline' allows only the first grasp."
+        f"Max grasp attempts for this condition: {max_attempts} "
+        f"(initial + {max_attempts - 1} recovery). "
+        f"For feedback_N, N={_gemini_rounds} Gemini failure-classification round(s) "
+        f"(legacy: feedback → feedback_1, feedback_double → feedback_2)."
     )
 
     if seed is not None:

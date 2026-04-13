@@ -34,7 +34,12 @@ def main() -> None:
         default=0,
         help="0-based trial index (evaluate.py uses trial 0..n-1; seed defaults to 42+trial).",
     )
-    p.add_argument("--condition", default="feedback", help="e.g. feedback, feedback_3, baseline")
+    p.add_argument(
+        "--condition",
+        default="feedback_1",
+        help="e.g. baseline, feedback_1 (1 Gemini round), feedback_2 (2 rounds), feedback_N. "
+        "Legacy: feedback → feedback_1, feedback_double → feedback_2.",
+    )
     p.add_argument(
         "--seed",
         type=int,

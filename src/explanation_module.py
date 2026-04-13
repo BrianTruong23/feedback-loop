@@ -26,7 +26,6 @@ GRASP_CHECKPOINTS = [
     "gripper_aligned_above_target",
     "fingers_enclosing_target",
     "object_lifted_clear_of_bin",
-    "correct_object_in_gripper",
 ]
 
 OBJECT_TASK_DESCRIPTORS = {
@@ -148,7 +147,7 @@ Definitions:
 
 Respond with EXACTLY this JSON (no markdown, no extra keys):
 {{
-  "failed_checkpoint": "<one of the 5 checkpoints above>",
+  "failed_checkpoint": "<one of the checkpoints above>",
   "failure_type": "<one of the 8 types above>",
   "explanation": "<1-2 sentences describing what you observe across the frames>",
   "confidence": <float 0.0 to 1.0>

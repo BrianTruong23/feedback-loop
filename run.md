@@ -16,7 +16,7 @@ pip install -r requirements.txt
 # One trial only (e.g. trial index 1 = second trial, seed 43 — no need to run trial 0 first)
 # python eval/run_single_trial.py --trial 1
 
-# Full evaluation (5 trials × 4 conditions = 20 runs)
+# Full evaluation (10 trials × 4 conditions; skips completed trials in runs/)
 
 python eval/evaluate.py
 
@@ -26,11 +26,11 @@ python eval/test_evaluate.py
 
 # Single run with feedback
 
-python -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback')"
+python -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback_1')"
 
 # Single run with double feedback
 
-python -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback_double')"
+python -c "from src.baseline import run_baseline; run_baseline('pick the cereal', condition='feedback_2')"
 
 # Single run with 6 feedback
 
