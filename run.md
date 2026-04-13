@@ -13,6 +13,9 @@ pip install -r requirements.txt
 
 # 4. Run options:
 
+# One trial only (e.g. trial index 1 = second trial, seed 43 — no need to run trial 0 first)
+# python eval/run_single_trial.py --trial 1
+
 # Full evaluation (5 trials × 4 conditions = 20 runs)
 
 python eval/evaluate.py

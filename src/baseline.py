@@ -8,12 +8,16 @@ import platform
 import sys
 import datetime
 import re
+import hashlib
+from pathlib import Path
 from PIL import Image, ImageDraw
 
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    # Always load repo-root .env (cwd often differs, e.g. IDEs or subprocesses).
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    load_dotenv(_PROJECT_ROOT / ".env")
 except ImportError:
     pass
 from robosuite.utils.camera_utils import get_camera_transform_matrix, get_real_depth_map, transform_from_pixels_to_world, project_points_from_world_to_camera
@@ -22,11 +26,15 @@ import robosuite.utils.transform_utils as T
 # Default cereal pose when not using BASELINE_RANDOMIZE_CEREAL=1
 CEREAL_BOX_YAW_DEG = -45.0
 DEFAULT_CEREAL_POS_M = np.array([0.08, -0.25, 0.9], dtype=float)
-# Random placement ranges (world frame, meters / degrees) — bin-centered workspace.
+# Random placement: only X and Y vary per (seed, trial_idx). Z and in-plane yaw match
+# main-branch fixed pose (CEREAL_BOX_YAW_DEG) so arm–object yaw alignment stays consistent.
 RANDOM_CEREAL_X_RANGE_M = (0.03, 0.13)
 RANDOM_CEREAL_Y_RANGE_M = (-0.32, -0.18)
+# Legacy (unused): Z and yaw were previously sampled; kept for snapshot compatibility.
 RANDOM_CEREAL_Z_RANGE_M = (0.885, 0.915)
 RANDOM_CEREAL_YAW_DEG_RANGE = (-80.0, 80.0)
+# Legacy: was used in integer stream = seed + trial_idx * M; kept for metrics snapshots.
+CEREAL_PLACEMENT_RNG_TRIAL_MULTIPLIER = 100_003
 POS_GAIN = 3.4
 MAX_CART_ACTION = 0.45
 POS_TOL = 0.005
@@ -51,7 +59,8 @@ GRASP_LIFT_Z_OFFSET_M = 0.35
 # that disagrees with actual object height (depth projection is used only as fallback).
 GRASP_Z_OFFSET_FROM_COM_M = 0.0
 # Align gripper +X (world XY) to the target object's body axis from sim GT before OWL-ViT.
-# "y" often matches straddling the box along its local y; use "x" for the other edge.
+# Must match **main**: use "y" so approach yaw follows ``object_body_y_planar_yaw_deg``
+# (straddle / edge-parallel grasp). "x" uses ``object_body_x_planar_yaw_deg`` instead (~90° off).
 GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS = "y"
 GRASP_APPROACH_YAW_OFFSET_DEG = 0.0
 # Tip detection (simplified cereal): body up vs world Z, and COM height vs standing pose.
@@ -93,13 +102,17 @@ def get_target_object_ground_truth(env, target_obj_name):
             pos = np.array(env.sim.data.body_xpos[body_id], dtype=float)
             quat = np.array(env.sim.data.body_xquat[body_id], dtype=float)
             R = T.quat2mat(quat)
+            yaw_x = float(np.rad2deg(_axis_planar_yaw_rad(R, 0)))
+            yaw_y = float(np.rad2deg(_axis_planar_yaw_rad(R, 1)))
             return {
                 "object_name": obj.name,
                 "root_body": obj.root_body,
                 "com_xyz": pos.tolist(),
                 "quat_wxyz": quat.tolist(),
-                "object_body_x_planar_yaw_deg": float(np.rad2deg(_axis_planar_yaw_rad(R, 0))),
-                "object_body_y_planar_yaw_deg": float(np.rad2deg(_axis_planar_yaw_rad(R, 1))),
+                "object_body_x_planar_yaw_deg": yaw_x,
+                "object_body_y_planar_yaw_deg": yaw_y,
+                # Same as body +X planar yaw: world-Z rotation of the box for an upright object.
+                "object_body_z_yaw_deg": yaw_x,
             }
     return None
 
@@ -127,20 +140,41 @@ def snapshot_tunable_constants():
         "RANDOM_CEREAL_Y_RANGE_M": RANDOM_CEREAL_Y_RANGE_M,
         "RANDOM_CEREAL_Z_RANGE_M": RANDOM_CEREAL_Z_RANGE_M,
         "RANDOM_CEREAL_YAW_DEG_RANGE": RANDOM_CEREAL_YAW_DEG_RANGE,
+        "CEREAL_PLACEMENT_RNG_TRIAL_MULTIPLIER": CEREAL_PLACEMENT_RNG_TRIAL_MULTIPLIER,
     }
 
 
+def make_cereal_placement_rng(seed, trial_idx):
+    """
+    RNG used for random cereal **XY** when BASELINE_RANDOMIZE_CEREAL=1.
+
+    - If ``seed`` is None: new unpredictable (x, y) each run (not reproducible).
+    - If ``seed`` is set: **same** ``(seed, trial_idx)`` always yields the **same** (x, y)
+      (eval uses ``seed=42+trial`` so trial 0..4 get five distinct layouts).
+    - **Z** and **yaw** are fixed to ``DEFAULT_CEREAL_POS_M[2]`` and ``CEREAL_BOX_YAW_DEG``
+      (main-branch pose), so the arm still aligns to the box from GT.
+
+    The stream is derived from a stable hash of ``(seed, trial_idx)``.
+    """
+    if seed is None:
+        return np.random.default_rng()
+    # Hash mix avoids any accidental stream collision if callers pass inconsistent
+    # seed/trial_idx combinations; distinct pairs get distinct PCG64 seeds.
+    payload = f"cereal_placement:v2:{int(seed)}:{int(trial_idx)}".encode()
+    digest = hashlib.sha256(payload).digest()
+    stream = int.from_bytes(digest[:8], "big")
+    if stream == 0:
+        stream = 1
+    return np.random.default_rng(stream)
+
+
 def sample_random_cereal_placement(rng):
-    """Sample position and yaw (about world Z) for cereal in the simplified bin."""
-    pos = np.array(
-        [
-            rng.uniform(*RANDOM_CEREAL_X_RANGE_M),
-            rng.uniform(*RANDOM_CEREAL_Y_RANGE_M),
-            rng.uniform(*RANDOM_CEREAL_Z_RANGE_M),
-        ],
-        dtype=float,
-    )
-    yaw_deg = float(rng.uniform(*RANDOM_CEREAL_YAW_DEG_RANGE))
+    """Sample (x, y) in the bin; z and yaw match main fixed pose so box/arm yaw stay aligned."""
+    x = float(rng.uniform(*RANDOM_CEREAL_X_RANGE_M))
+    y = float(rng.uniform(*RANDOM_CEREAL_Y_RANGE_M))
+    z = float(DEFAULT_CEREAL_POS_M[2])
+    yaw_deg = float(CEREAL_BOX_YAW_DEG)
+    pos = np.array([x, y, z], dtype=float)
     return {"pos": pos, "yaw_deg": yaw_deg}
 
 
@@ -148,6 +182,10 @@ def apply_cereal_pose(env, pos_xyz, yaw_deg):
     """
     Place the cereal box at pos_xyz with rotation about world Z given by yaw_deg
     (same free-joint convention as the previous fixed simplify pose).
+
+    This calls ``env.sim.step()`` many times, so the whole scene (including the arm)
+    advances while any existing ``obs`` from ``env.reset()`` is **stale**. Callers must
+    run ``env.step(zeros)`` (or otherwise refresh observations) before using ``obs``.
     """
     cereal_pos = np.asarray(pos_xyz, dtype=float).reshape(3)
     half_yaw_rad = np.deg2rad(float(yaw_deg)) / 2.0
@@ -279,6 +317,32 @@ def draw_red_grid_on_array(img_array):
     except:
         return img_array
 
+
+def draw_owlvit_box_on_rgb(img_rgb, box_xyxy, score_text=""):
+    """
+    Draw OWL-ViT detection box on a frontview RGB frame (same pixel space as model input).
+    img_rgb: (H, W, 3) uint8; box_xyxy: [x0, y0, x1, y1] in pixels.
+    """
+    try:
+        from PIL import ImageDraw
+
+        im = Image.fromarray(np.asarray(img_rgb, dtype=np.uint8).copy())
+        draw = ImageDraw.Draw(im)
+        x0, y0, x1, y1 = [float(x) for x in np.asarray(box_xyxy).ravel()[:4]]
+        draw.rectangle([x0, y0, x1, y1], outline=(0, 255, 0), width=4)
+        cap = score_text or "OWL-ViT"
+        ty = max(0, int(y0) - 18)
+        draw.text((int(x0), ty), cap, fill=(0, 255, 0))
+        return np.array(im)
+    except Exception as e:
+        print(f"OWL overlay draw error: {e}")
+        return np.asarray(img_rgb)
+
+
+# Hold OWL detection overlay in the MP4 so the box is visible before the grasp motion (~1s at 20fps).
+OWL_DETECTION_VIDEO_HOLD_FRAMES = 20
+
+
 def get_max_attempts_for_condition(condition):
     if condition == "feedback":
         return 2
@@ -292,10 +356,29 @@ def get_max_attempts_for_condition(condition):
 def failure_type_implies_grasp_success(failure_type):
     return failure_type == "slip_after_contact"
 
+
+def instruction_to_target_object_name(instruction):
+    """Map free-text instruction to robosuite object name, or None if unknown."""
+    if not instruction:
+        return None
+    s = instruction.lower()
+    if "milk" in s:
+        return "Milk"
+    if "bread" in s:
+        return "Bread"
+    if "cereal" in s:
+        return "Cereal"
+    if "can" in s:
+        return "Can"
+    return None
+
+
 def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
     # Normalize so "Feedback", " feedback ", etc. still enable recovery; must match get_max_attempts_for_condition.
     if condition is not None:
         condition = str(condition).strip().lower()
+
+    placement_only = os.environ.get("BASELINE_CEREAL_PLACEMENT_ONLY", "0").strip() == "1"
 
     print(f"\n--- Starting Trial {trial_idx} | Condition: {condition} ---")
     print(f"Language Instruction: '{instruction}'")
@@ -325,7 +408,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     # 1. Perception Step (OWL-ViT initialization)
     if device is None:
         device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    if processor is None or model is None:
+    if not placement_only and (processor is None or model is None):
         print("Loading OWL-ViT model onto device...")
         processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
         model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(device)
@@ -375,18 +458,32 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
 
     def step_towards(current_obs, target_xyz, gripper_action, steps=10, settle=False):
+        """
+        Move EEF toward target using cosine-eased waypoints along the segment from the
+        pose at call time to the goal. This matches manual_grasp.py and avoids taking
+        zero env.step() calls when stale obs or tolerance would skip the whole segment.
+        """
         target_xyz = np.array(target_xyz, dtype=float)
+        start_xyz = np.asarray(current_obs["robot0_eef_pos"], dtype=float).copy()
+        n = max(int(steps), 1)
 
-        for _ in range(steps):
-            current_eef = current_obs['robot0_eef_pos']
-            delta = target_xyz - current_eef
+        for step_idx in range(n):
+            progress = (step_idx + 1) / float(n)
+            eased = 0.5 - 0.5 * np.cos(np.pi * progress)
+            waypoint = start_xyz + (target_xyz - start_xyz) * eased
+            current_eef = current_obs["robot0_eef_pos"]
+            delta = waypoint - current_eef
             if np.linalg.norm(target_xyz - current_eef) < POS_TOL:
                 break
 
             action = np.zeros(7)
-            distance = np.linalg.norm(delta)
+            distance = float(np.linalg.norm(target_xyz - current_eef))
             speed_scale = 1.0 if distance > 0.10 else (0.7 if distance > 0.04 else 0.45)
-            action[:3] = np.clip(delta * POS_GAIN, -MAX_CART_ACTION * speed_scale, MAX_CART_ACTION * speed_scale)
+            action[:3] = np.clip(
+                delta * POS_GAIN,
+                -MAX_CART_ACTION * speed_scale,
+                MAX_CART_ACTION * speed_scale,
+            )
             action[6] = gripper_action
             current_obs, reward, done, info = env.step(action)
             if video_enabled and video_writer:
@@ -530,16 +627,14 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     simplify_environment(env)
     randomize_cereal = os.environ.get("BASELINE_RANDOMIZE_CEREAL", "0").strip() == "1"
     if randomize_cereal:
-        if seed is not None:
-            rng = np.random.default_rng(int(seed) + int(trial_idx) * 100_003)
-        else:
-            rng = np.random.default_rng()
+        rng = make_cereal_placement_rng(seed, trial_idx)
         episode_cereal_pose = sample_random_cereal_placement(rng)
         print(
-            "--- RANDOM CEREAL PLACEMENT: "
+            "--- RANDOM CEREAL PLACEMENT (XY by seed/trial; Z & yaw = main fixed pose): "
+            f"trial_idx={trial_idx}, seed={seed!r}, "
             f"pos={np.round(episode_cereal_pose['pos'], 4)} m, "
             f"yaw_deg={episode_cereal_pose['yaw_deg']:.2f} "
-            "(BASELINE_RANDOMIZE_CEREAL=1; arm yaw still matches object axis from GT) ---"
+            "(OWL overlay unchanged; arm aligns to box GT yaw) ---"
         )
     else:
         episode_cereal_pose = {
@@ -553,21 +648,73 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             "(set BASELINE_RANDOMIZE_CEREAL=1 for random pose per run) ---"
         )
     apply_cereal_pose(env, episode_cereal_pose["pos"], episode_cereal_pose["yaw_deg"])
+    # apply_cereal_pose() runs many sim.substeps; obs from reset() no longer matches sim.
+    hold = np.zeros(int(env.action_dim))
+    obs, _, _, _ = env.step(hold)
+
+    if placement_only:
+        print(
+            "--- BASELINE_CEREAL_PLACEMENT_ONLY=1: skipping arm motion, OWL-ViT, grasp, and Gemini ---"
+            "(unset BASELINE_CEREAL_PLACEMENT_ONLY for full video with OWL-ViT + pick attempt; "
+            "use BASELINE_SKIP_GEMINI=1 if you only want to skip Gemini on failure.) ---"
+        )
+        metrics["placement_only"] = True
+        metrics["failure_type"] = "placement_only_skip"
+        target_obj_name = instruction_to_target_object_name(instruction)
+        try:
+            png_path = os.path.join(run_dir, "cereal_placement_view.png")
+            Image.fromarray(create_frontview_image(obs, env)).save(png_path)
+            print(f"Placement snapshot → {png_path}")
+        except Exception:
+            pass
+        if video_enabled and video_writer:
+            try:
+                view_rgb = obs["frontview_image"][::-1]
+                # Many decoders reject 0-frame MP4s; duplicate one frame for a short valid clip.
+                for _ in range(20):
+                    video_writer.append_data(view_rgb)
+                video_writer.close()
+                print(f"Video saved → {current_vid_path}")
+            except Exception as e:
+                print(f"Warning: could not write placement-only video: {e}")
+        elif not video_enabled:
+            print(
+                "No video (BASELINE_RENDER=0); use cereal_placement_view.png or unset BASELINE_RENDER."
+            )
+        env.close()
+        metrics["latency"] = time.time() - start_time
+        try:
+            import json as _json
+
+            with open(os.path.join(run_dir, "trial_summary.json"), "w") as f:
+                _json.dump(
+                    {
+                        "condition": condition,
+                        "instruction": instruction,
+                        "trial_idx": trial_idx,
+                        "run_dir": run_dir,
+                        "target_object": target_obj_name,
+                        "cereal_episode_pose_m": {
+                            "pos": np.asarray(episode_cereal_pose["pos"], dtype=float).tolist(),
+                            "yaw_deg": float(episode_cereal_pose["yaw_deg"]),
+                        },
+                        "baseline_randomize_cereal": bool(randomize_cereal),
+                        **metrics,
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"Trial summary → {os.path.join(run_dir, 'trial_summary.json')}")
+        except Exception:
+            pass
+        return metrics
 
     # CLEAR VIEW: retract along the same smoothed motion profile used for grasping.
     print("--- CLEAR VIEW: Retracting arm for initial perception ---")
     retract_pos = np.array([0.4, -0.6, 1.4])
-    obs = step_towards(obs, retract_pos, gripper_action=-1, steps=12)
+    obs = step_towards(obs, retract_pos, gripper_action=-1, steps=28)
 
-    target_obj_name = None
-    if "milk" in instruction.lower():
-        target_obj_name = "Milk"
-    elif "bread" in instruction.lower():
-        target_obj_name = "Bread"
-    elif "cereal" in instruction.lower():
-        target_obj_name = "Cereal"
-    elif "can" in instruction.lower():
-        target_obj_name = "Can"
+    target_obj_name = instruction_to_target_object_name(instruction)
 
     if not target_obj_name:
         print("Failure Reasoning: 'wrong-object selection'")
@@ -587,8 +734,8 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         approach_yaw_world_deg_used = float(approach_yaw_deg)
         approach_axis_used = ax
         print(
-            f"--- APPROACH YAW: align gripper +X to object {ax}-axis "
-            f"(world yaw {approach_yaw_deg:.1f}°) before detection/grasp ---"
+            f"--- APPROACH YAW: align gripper +X to object body {ax}-axis in world XY "
+            f"(box rotation → world yaw {approach_yaw_deg:.1f}°) before OWL-ViT / grasp ---"
         )
         obs = rotate_yaw_to_world_yaw(
             obs, np.deg2rad(approach_yaw_deg), gripper_action=-1, steps=40
@@ -644,7 +791,21 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     score = results[0]["scores"][best_idx].cpu().numpy()
     
     print(f"OWL-ViT Detected '{target_obj_name}' with score {score:.3f}")
-    
+
+    score_f = float(np.asarray(score).reshape(-1)[0])
+    owlvit_overlay = draw_owlvit_box_on_rgb(
+        img, box, score_text=f"OWL-ViT {score_f:.2f}"
+    )
+    try:
+        Image.fromarray(owlvit_overlay).save(
+            os.path.join(run_dir, "owlvit_detection_overlay.png")
+        )
+    except Exception:
+        pass
+    if video_enabled and video_writer:
+        for _ in range(OWL_DETECTION_VIDEO_HOLD_FRAMES):
+            video_writer.append_data(owlvit_overlay)
+
     # Calculate pixel center
     u = (box[0] + box[2]) / 2.0
     v = (box[1] + box[3]) / 2.0
@@ -682,6 +843,8 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
     # VLM Target 3D Position
     obj_pos = pt_3d.copy()
+    # OWL overlay loop appended duplicate pixels without stepping physics; refresh obs once.
+    obs, _, _, _ = env.step(np.zeros(int(env.action_dim)))
 
     try:
         gt0 = get_target_object_ground_truth(env, target_obj_name)
@@ -702,6 +865,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 "gt_body_axes_planar_yaw_deg": {
                     "x": gt0["object_body_x_planar_yaw_deg"],
                     "y": gt0["object_body_y_planar_yaw_deg"],
+                    "z_box_yaw_deg": gt0.get("object_body_z_yaw_deg"),
                 },
                 "approach_yaw_world_deg": float(approach_yaw_world_deg_used),
                 "approach_axis_aligned_to": approach_axis_used,
@@ -737,18 +901,21 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         target_pos,
         settle_steps=6,
         pre_yaw_deg=0.0,
-        descent_steps=8,
+        descent_steps=24,
     ):
         attempt_frames = {}
 
         print("Action Plan: Hovering above object...")
         hover_pos = target_pos.copy()
         hover_pos[2] += GRASP_HOVER_Z_OFFSET_M
-        current_obs = step_towards(current_obs, hover_pos, gripper_action=-1, steps=10)
+        current_obs = step_towards(current_obs, hover_pos, gripper_action=-1, steps=32)
         attempt_frames["pre_hover"] = create_frontview_image(current_obs, env)
 
+        # Approach yaw is applied once before OWL-ViT (rotate_yaw_to_world_yaw); main does not
+        # rotate again after hover—only optional recovery pre_yaw_deg.
+
         if abs(pre_yaw_deg) > 0.5:
-            print(f"Action Plan: Rotating gripper {pre_yaw_deg:.0f}° before descent...")
+            print(f"Action Plan: Rotating gripper {pre_yaw_deg:.0f}° (recovery) before descent...")
             current_obs = rotate_yaw_in_place(
                 current_obs, np.deg2rad(pre_yaw_deg), gripper_action=-1, steps=20
             )
@@ -768,7 +935,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         print("Action Plan: Lifting...")
         lift_pos = grasp_pos.copy()
         lift_pos[2] += GRASP_LIFT_Z_OFFSET_M
-        current_obs = step_towards(current_obs, lift_pos, gripper_action=1, steps=10)
+        current_obs = step_towards(current_obs, lift_pos, gripper_action=1, steps=28)
         attempt_frames["post_lift"] = create_frontview_image(current_obs, env)
 
         lifted_any, target_ok, wrong_ok = check_objects_lifted(env, target_obj_name)
@@ -833,7 +1000,10 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
             metrics["wrong_object"] = True
             metrics["grasp_success"] = True
 
-        feedback_enabled = condition == "explanation_only" or condition.startswith("feedback")
+        skip_gemini = os.environ.get("BASELINE_SKIP_GEMINI", "0").strip() == "1"
+        feedback_enabled = (
+            condition == "explanation_only" or condition.startswith("feedback")
+        ) and not skip_gemini
         if feedback_enabled:
             from src.explanation_module import classify_failure, OPENROUTER_MODEL
             import json as _json

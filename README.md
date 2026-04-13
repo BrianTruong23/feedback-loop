@@ -15,7 +15,7 @@ The default pipeline is intentionally **narrow** so experiments stay reproducibl
 - **Single target object** — In simplified mode (e.g. cereal-only), perception and recovery focus on **one** object in clutter; multi-object competition is limited.
 - **Constrained approach orientation** — The arm aligns to a **fixed strategy** (e.g. gripper yaw aligned to a chosen body axis from simulation ground truth before the first grasp), not full free exploration of wrist orientation.
 - **Reset-to-nominal between attempts** — If the box **tips**, it can be **snapped back** to this run’s **nominal** cereal pose (fixed default, or the random draw for this episode if `BASELINE_RANDOMIZE_CEREAL=1`) before the next recovery attempt.
-- **Optional random cereal placement** — Set `BASELINE_RANDOMIZE_CEREAL=1` to sample a new **x, y, z** and **in-plane yaw** for the cereal box each run (ranges in `src/baseline.py`). **OWL-ViT** still supplies **x, y** in the image; **z** comes from sim **COM**; **gripper yaw** still **matches** the chosen object body axis from ground truth. **Gemini** still maps failure type → fixed recovery primitives.
+- **Optional random cereal placement** — Set `BASELINE_RANDOMIZE_CEREAL=1` to sample **x, y** in the bin per `(seed, trial_idx)` (same trial → same XY; five eval trials → five layouts). **Z** and **box yaw** stay the **main-branch fixed pose** (`DEFAULT_CEREAL_POS_M` / `CEREAL_BOX_YAW_DEG`) so arm–object yaw alignment is stable. **OWL-ViT** overlay and detection unchanged; **gripper yaw** still follows object GT. **Gemini** still maps failure type → fixed recovery primitives.
 
 These choices trade realism for **debuggability** and stable metrics (turn randomization on when you want variation across runs).
 
@@ -145,7 +145,24 @@ Every simulation run generates a timestamped directory in `runs/`:
   ```bash
    export BASELINE_RANDOMIZE_CEREAL=1
   ```
-   Leave unset or `0` for the fixed default pose. Use `run_baseline(..., seed=123)` for reproducible random placement across trials.
+   Leave unset or `0` for the fixed default pose. The file must live at the **repo root** (loading no longer depends on shell `cwd`).
+
+   **Reproducible random cereal (recommended):** With `BASELINE_RANDOMIZE_CEREAL=1`, **only world X and Y** are sampled from a RNG keyed by a **stable hash** of `(seed, trial_idx)` (see `make_cereal_placement_rng` / `sample_random_cereal_placement` in `baseline.py`). **Z** and **in-plane box yaw** stay fixed like **main** (`CEREAL_BOX_YAW_DEG`), so the arm still rotates to the box’s yaw from sim GT.
+
+   - **Same** `(seed, trial_idx)` on any day → **same** XY (good for science).
+   - **Different** `trial_idx` (with the usual `seed=42+trial` from `eval/evaluate.py` or `eval/run_single_trial.py`) → **different** XY for trials 0–4.
+   - Re-running **trial 0** later with the same parameters → **same** pose as the first trial 0 (that is what you want for reproducibility).
+
+   **Truly different pose every run:** use `seed=None` in `run_baseline`, or `python eval/run_single_trial.py --stochastic`.
+
+   **Why does one trial look “always the same” when I repeat it?**  
+   Because the seed is fixed on purpose — use a different `trial_idx` or `seed` if you want a different *labeled* trial, not `--stochastic` if you want reproducibility.
+
+   **Cereal placement only (no OWL-ViT, no Gemini):** set `BASELINE_CEREAL_PLACEMENT_ONLY=1` (with `BASELINE_RANDOMIZE_CEREAL=1` to randomize). Then `python eval/evaluate.py` skips loading OWL-ViT and runs only the `baseline` condition; each trial still uses the usual `(seed, trial_idx)` so you can compare trial 0 vs 1 in logs and `trial_summary.json`. Or: `python eval/run_single_trial.py --trial 1 --placement-only`. Artifacts include `cereal_placement_view.png` and a short `attempt_1.mp4` (requires `BASELINE_RENDER` unset or `1`; if `BASELINE_RENDER=0`, you only get the PNG). **Do not** use placement-only if you want the robot to run OWL-ViT and attempt a grasp in the video—use a normal run (unset `BASELINE_CEREAL_PLACEMENT_ONLY`). The recording then includes a green-box OWL detection segment, then hover / descend / grasp / lift.
+
+   **Full run, but no Gemini on failure:** `BASELINE_SKIP_GEMINI=1` keeps OWL-ViT and grasp in the video; only the failure-classification API call is skipped.
+
+   **Full evaluation but skip Gemini on grasp failure:** set `BASELINE_SKIP_GEMINI=1`, or `python eval/run_single_trial.py --skip-gemini`.
 4. **Full Evaluation** (5 trials × 4 conditions = 20 runs):
   ```bash
    python eval/evaluate.py

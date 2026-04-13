@@ -16,17 +16,32 @@ from src.baseline import run_baseline
 os.environ["BASELINE_RENDER"] = "1"
 
 def evaluate():
+    placement_only = os.environ.get("BASELINE_CEREAL_PLACEMENT_ONLY", "0").strip() == "1"
     conditions = ["baseline", "explanation_only", "feedback", "feedback_double"]
     n_trials = 5  # 5 trials per condition
-    
+
+    # Cereal pose does not depend on condition; one condition is enough to compare trial indices.
+    if placement_only:
+        conditions = ["baseline"]
+        print(
+            "BASELINE_CEREAL_PLACEMENT_ONLY=1: using condition 'baseline' only "
+            "(same cereal layout for all conditions at a given trial index)."
+        )
+
     # Pre-load Cereal specific prompt info
     target_text = "pick the cereal"
-    
-    # Load model once for all conditions to save time
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    print("Pre-loading OWL-ViT model globally...")
-    processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
-    model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(device)
+
+    # Load model once for all conditions to save time (skipped for placement-only smoke runs)
+    if placement_only:
+        processor = None
+        model = None
+        device = torch.device("cpu")
+        print("Skipping OWL-ViT load (cereal placement check only; no Gemini).")
+    else:
+        device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+        print("Pre-loading OWL-ViT model globally...")
+        processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
+        model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(device)
 
     all_results = []
     os.makedirs("metrics", exist_ok=True)
