@@ -9,10 +9,24 @@ import sys
 import datetime
 import re
 from PIL import Image, ImageDraw
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 from robosuite.utils.camera_utils import get_camera_transform_matrix, get_real_depth_map, transform_from_pixels_to_world, project_points_from_world_to_camera
 import robosuite.utils.transform_utils as T
 
+# Default cereal pose when not using BASELINE_RANDOMIZE_CEREAL=1
 CEREAL_BOX_YAW_DEG = -45.0
+DEFAULT_CEREAL_POS_M = np.array([0.08, -0.25, 0.9], dtype=float)
+# Random placement ranges (world frame, meters / degrees) — bin-centered workspace.
+RANDOM_CEREAL_X_RANGE_M = (0.03, 0.13)
+RANDOM_CEREAL_Y_RANGE_M = (-0.32, -0.18)
+RANDOM_CEREAL_Z_RANGE_M = (0.885, 0.915)
+RANDOM_CEREAL_YAW_DEG_RANGE = (-80.0, 80.0)
 POS_GAIN = 3.4
 MAX_CART_ACTION = 0.45
 POS_TOL = 0.005
@@ -109,13 +123,34 @@ def snapshot_tunable_constants():
         "GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS": GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS,
         "GRASP_APPROACH_YAW_OFFSET_DEG": GRASP_APPROACH_YAW_OFFSET_DEG,
         "LIFT_SUCCESS_BODY_Z_MIN_M": LIFT_SUCCESS_BODY_Z_MIN_M,
+        "RANDOM_CEREAL_X_RANGE_M": RANDOM_CEREAL_X_RANGE_M,
+        "RANDOM_CEREAL_Y_RANGE_M": RANDOM_CEREAL_Y_RANGE_M,
+        "RANDOM_CEREAL_Z_RANGE_M": RANDOM_CEREAL_Z_RANGE_M,
+        "RANDOM_CEREAL_YAW_DEG_RANGE": RANDOM_CEREAL_YAW_DEG_RANGE,
     }
 
 
-def apply_cereal_simplified_pose(env):
-    """Place the cereal box at the canonical pose used in simplify_environment."""
-    cereal_pos = np.array([0.08, -0.25, 0.9])
-    half_yaw_rad = np.deg2rad(CEREAL_BOX_YAW_DEG) / 2.0
+def sample_random_cereal_placement(rng):
+    """Sample position and yaw (about world Z) for cereal in the simplified bin."""
+    pos = np.array(
+        [
+            rng.uniform(*RANDOM_CEREAL_X_RANGE_M),
+            rng.uniform(*RANDOM_CEREAL_Y_RANGE_M),
+            rng.uniform(*RANDOM_CEREAL_Z_RANGE_M),
+        ],
+        dtype=float,
+    )
+    yaw_deg = float(rng.uniform(*RANDOM_CEREAL_YAW_DEG_RANGE))
+    return {"pos": pos, "yaw_deg": yaw_deg}
+
+
+def apply_cereal_pose(env, pos_xyz, yaw_deg):
+    """
+    Place the cereal box at pos_xyz with rotation about world Z given by yaw_deg
+    (same free-joint convention as the previous fixed simplify pose).
+    """
+    cereal_pos = np.asarray(pos_xyz, dtype=float).reshape(3)
+    half_yaw_rad = np.deg2rad(float(yaw_deg)) / 2.0
     cereal_quat = np.array([np.cos(half_yaw_rad), 0.0, 0.0, np.sin(half_yaw_rad)])
     cereal_id = env.sim.model.joint_name2id("Cereal_joint0")
     cereal_idx = env.sim.model.jnt_qposadr[cereal_id]
@@ -129,6 +164,11 @@ def apply_cereal_simplified_pose(env):
     qvel_idx = env.sim.model.jnt_dofadr[cereal_id]
     env.sim.data.qvel[qvel_idx : qvel_idx + 6] = 0.0
     env.sim.forward()
+
+
+def apply_cereal_simplified_pose(env):
+    """Place cereal at the default fixed pose (backward-compatible)."""
+    apply_cereal_pose(env, DEFAULT_CEREAL_POS_M, CEREAL_BOX_YAW_DEG)
 
 
 def is_cereal_box_tipped(env):
@@ -149,9 +189,10 @@ def is_cereal_box_tipped(env):
         return False
 
 
-def maybe_reset_cereal_if_tipped(env, target_obj_name):
+def maybe_reset_cereal_if_tipped(env, target_obj_name, episode_cereal_pose):
     """
-    If the cereal box tipped, restore canonical simplify pose (for cleaner retries).
+    If the cereal box tipped, restore this episode's nominal cereal pose (for retries).
+    episode_cereal_pose: dict with keys "pos" (3,), "yaw_deg" (float).
     Returns True if a reset was applied.
     """
     if "cereal" not in (target_obj_name or "").lower():
@@ -159,23 +200,21 @@ def maybe_reset_cereal_if_tipped(env, target_obj_name):
     if not is_cereal_box_tipped(env):
         return False
     print(
-        "--- Cereal tipped: resetting box to simplified pose before next attempt ---"
+        "--- Cereal tipped: resetting box to episode nominal pose before next attempt ---"
     )
-    apply_cereal_simplified_pose(env)
+    apply_cereal_pose(env, episode_cereal_pose["pos"], episode_cereal_pose["yaw_deg"])
     return True
 
 
 def simplify_environment(env):
-    """Reposition objects to create a 1-bin / 1-object simplified world (Cereal only)."""
+    """Hide non-target clutter; cereal placement is done separately via apply_cereal_pose."""
     print("--- SIMPLIFYING ENVIRONMENT: 1-Bin / 1-Object Mode (Cereal only) ---")
     try:
-        # Hide all objects except Cereal
         for obj_name in ["Bread_joint0", "Can_joint0", "Milk_joint0"]:
             j_id = env.sim.model.joint_name2id(obj_name)
             q_idx = env.sim.model.jnt_qposadr[j_id]
             env.sim.data.qpos[q_idx : q_idx + 3] = np.array([5.0, 5.0, -1.0])
-
-        apply_cereal_simplified_pose(env)
+        env.sim.forward()
     except Exception as e:
         print(f"Warning: Physics simplification failed: {e}")
 
@@ -487,9 +526,34 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     # 3. Task Execution
     obs = env.reset()
     
-    # SIMPLIFY: Re-position objects into 1-bin / 2-object configuration
+    # SIMPLIFY: hide clutter; then place cereal (fixed or random per env / seed).
     simplify_environment(env)
-    
+    randomize_cereal = os.environ.get("BASELINE_RANDOMIZE_CEREAL", "0").strip() == "1"
+    if randomize_cereal:
+        if seed is not None:
+            rng = np.random.default_rng(int(seed) + int(trial_idx) * 100_003)
+        else:
+            rng = np.random.default_rng()
+        episode_cereal_pose = sample_random_cereal_placement(rng)
+        print(
+            "--- RANDOM CEREAL PLACEMENT: "
+            f"pos={np.round(episode_cereal_pose['pos'], 4)} m, "
+            f"yaw_deg={episode_cereal_pose['yaw_deg']:.2f} "
+            "(BASELINE_RANDOMIZE_CEREAL=1; arm yaw still matches object axis from GT) ---"
+        )
+    else:
+        episode_cereal_pose = {
+            "pos": DEFAULT_CEREAL_POS_M.copy(),
+            "yaw_deg": float(CEREAL_BOX_YAW_DEG),
+        }
+        print(
+            "--- FIXED CEREAL PLACEMENT: "
+            f"pos={np.round(episode_cereal_pose['pos'], 4)} m, "
+            f"yaw_deg={episode_cereal_pose['yaw_deg']:.2f} "
+            "(set BASELINE_RANDOMIZE_CEREAL=1 for random pose per run) ---"
+        )
+    apply_cereal_pose(env, episode_cereal_pose["pos"], episode_cereal_pose["yaw_deg"])
+
     # CLEAR VIEW: retract along the same smoothed motion profile used for grasping.
     print("--- CLEAR VIEW: Retracting arm for initial perception ---")
     retract_pos = np.array([0.4, -0.6, 1.4])
@@ -914,7 +978,9 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 except Exception:
                     pass
 
-                if maybe_reset_cereal_if_tipped(env, target_obj_name):
+                if maybe_reset_cereal_if_tipped(
+                    env, target_obj_name, episode_cereal_pose
+                ):
                     obj_pos = initial_owlvit_3d.copy()
 
                 print(f"\n--- RECOVERY ATTEMPT {metrics['attempts']} | policy={failure_type} ---")
@@ -1051,6 +1117,11 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 "instruction": instruction,
                 "trial_idx": trial_idx,
                 "run_dir": run_dir,
+                "cereal_episode_pose_m": {
+                    "pos": np.asarray(episode_cereal_pose["pos"], dtype=float).tolist(),
+                    "yaw_deg": float(episode_cereal_pose["yaw_deg"]),
+                },
+                "baseline_randomize_cereal": bool(randomize_cereal),
                 **metrics,
             }, f, indent=2)
         print(f"Trial summary → {os.path.join(run_dir, 'trial_summary.json')}")
@@ -1058,6 +1129,11 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         tuning_payload = {
             "run_dir": run_dir,
             "target_object": target_obj_name,
+            "cereal_episode_pose": {
+                "pos": np.asarray(episode_cereal_pose["pos"], dtype=float).tolist(),
+                "yaw_deg": float(episode_cereal_pose["yaw_deg"]),
+            },
+            "baseline_randomize_cereal": bool(randomize_cereal),
             "tunable_constants": snapshot_tunable_constants(),
             "initial_detection_vs_gt": initial_detection_vs_gt,
             "per_grasp_contact_snapshot": tuning_grasp_records,

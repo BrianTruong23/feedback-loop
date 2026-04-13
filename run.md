@@ -8,6 +8,9 @@ pip install -r requirements.txt
 
 # 3. Make sure your .env file contains your OPENROUTER_API_KEY
 
+# Optional: random cereal x/y/z/yaw each run (OWL→xy, sim COM→z, arm yaw matches object GT)
+# export BASELINE_RANDOMIZE_CEREAL=1
+
 # 4. Run options:
 
 # Full evaluation (5 trials × 4 conditions = 20 runs)
