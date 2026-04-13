@@ -195,6 +195,14 @@ Respond with EXACTLY this JSON (no markdown, no extra keys):
         if data.get("failed_checkpoint") not in GRASP_CHECKPOINTS:
             data["failed_checkpoint"] = "unknown"
         data["prompt_text"] = prompt  # expose for run-log saving
+        # Full text-side transcript of the user message (images as placeholders).
+        transcript_parts = []
+        for item in content:
+            if item.get("type") == "text":
+                transcript_parts.append(item["text"])
+            elif item.get("type") == "image_url":
+                transcript_parts.append("<IMAGE_JPEG_BASE64_OMITTED>")
+        data["prompt_transcript"] = "\n\n".join(transcript_parts)
         return data
     except Exception as e:
         print(f"Error querying Gemini: {e}")

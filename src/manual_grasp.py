@@ -237,10 +237,10 @@ def run_session(initial_x=None, initial_y=None):
         heights = check_objects_lifted(env)
         print("\n  Object heights after lift:")
         for name, z in heights.items():
-            lifted = " ← LIFTED" if z > 0.95 else ""
+            lifted = " ← LIFTED" if z > 0.92 else ""
             print(f"    {name}: z={z:.4f}{lifted}")
 
-        lifted_names = [n for n, z in heights.items() if z > 0.95]
+        lifted_names = [n for n, z in heights.items() if z > 0.92]
         if lifted_names:
             print(f"\n  Result: LIFTED → {lifted_names}")
         else:

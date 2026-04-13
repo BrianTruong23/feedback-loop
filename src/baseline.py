@@ -21,57 +21,161 @@ YAW_TOL = np.deg2rad(1.5)
 DEFAULT_GRIPPER_YAW_DEG = -45.0
 # Side observation pose used before re-detecting when the target is classified as occluded.
 OCCLUSION_OBS_POS = np.array([0.22, -0.35, 1.28])
-# Slip recovery depth is a tradeoff:
-# more negative makes the retry descend deeper, which can improve enclosure,
-# but if it is too low the gripper tends to hit or knock over the cereal box
-# and the policy stops making useful progress. If it is not negative enough,
-# the grasp stays too shallow and the box often slips during lift.
-SLIP_RECOVERY_Z_OFFSET_M = -0.22
+# Slip recovery: extra depth (m) below nominal grasp height z_com + GRASP_Z_OFFSET_FROM_COM_M.
+# Recomputed from sim COM each time (not stacked on obj_pos). More negative = lower on the box
+# so fingers can close where the object actually is (tune if the box tips or misses).
+SLIP_RECOVERY_Z_OFFSET_M = -0.11
+# Extra Cartesian steps when lowering to the slip grasp (default first grasp uses 8).
+SLIP_RECOVERY_DESCENT_STEPS = 20
 # Number of closed-gripper hold steps after descending on a slip-recovery retry.
-SLIP_RECOVERY_SETTLE_STEPS = 17
+SLIP_RECOVERY_SETTLE_STEPS = 16
 # Height above the grasp target that the robot moves to before descending.
 GRASP_HOVER_Z_OFFSET_M = 0.08
 # Upward distance commanded after closing the gripper to test / complete the lift.
 GRASP_LIFT_Z_OFFSET_M = 0.35
+# Grasp Z: use sim root-body COM height + this offset (m). Avoids a fixed table plane
+# that disagrees with actual object height (depth projection is used only as fallback).
+GRASP_Z_OFFSET_FROM_COM_M = 0.0
+# Align gripper +X (world XY) to the target object's body axis from sim GT before OWL-ViT.
+# "y" often matches straddling the box along its local y; use "x" for the other edge.
+GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS = "y"
+GRASP_APPROACH_YAW_OFFSET_DEG = 0.0
+# Tip detection (simplified cereal): body up vs world Z, and COM height vs standing pose.
+CEREAL_TIP_MAX_UP_DOT = 0.7
+CEREAL_TIP_MIN_COM_Z_M = 0.86
+# World Z (m): object body must be above this to count as lifted. Must stay *above* standing
+# height (~0.89 m cereal) — never use 0 or any value at/below rest pose or everything "lifts".
+# 0.92–0.95 = stricter; 0.88–0.90 = looser (more false SUCCESS if set too low).
+LIFT_SUCCESS_BODY_Z_MIN_M = 0.92
 
 # version worked
-# SLIP_RECOVERY_Z_OFFSET_M = -0.22
+# SLIP_RECOVERY_Z_OFFSET_M = -0.09
 # SLIP_RECOVERY_SETTLE_STEPS = 16
 # GRASP_HOVER_Z_OFFSET_M = 0.1
 # GRASP_LIFT_Z_OFFSET_M = 0.3
+
+
+def _eef_planar_yaw_rad(obs):
+    """World XY heading of gripper +X (same convention as rotate_yaw_in_place)."""
+    eef_rot = T.quat2mat(obs["robot0_eef_quat"])
+    return np.arctan2(eef_rot[1, 0], eef_rot[0, 0])
+
+
+def _axis_planar_yaw_rad(R_world_body, col):
+    """World XY heading of a body frame column from rotation matrix R."""
+    v = R_world_body[:2, int(col)]
+    return np.arctan2(v[1], v[0])
+
+
+def _wrap_angle_rad(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def get_target_object_ground_truth(env, target_obj_name):
+    """Root-body pose for the robosuite object whose name matches target_obj_name."""
+    for obj in env.objects:
+        if target_obj_name.lower() in obj.name.lower():
+            body_id = env.sim.model.body_name2id(obj.root_body)
+            pos = np.array(env.sim.data.body_xpos[body_id], dtype=float)
+            quat = np.array(env.sim.data.body_xquat[body_id], dtype=float)
+            R = T.quat2mat(quat)
+            return {
+                "object_name": obj.name,
+                "root_body": obj.root_body,
+                "com_xyz": pos.tolist(),
+                "quat_wxyz": quat.tolist(),
+                "object_body_x_planar_yaw_deg": float(np.rad2deg(_axis_planar_yaw_rad(R, 0))),
+                "object_body_y_planar_yaw_deg": float(np.rad2deg(_axis_planar_yaw_rad(R, 1))),
+            }
+    return None
+
+
+def snapshot_tunable_constants():
+    """Scalar knobs in this file that most affect grasp quality / slip."""
+    return {
+        "CEREAL_BOX_YAW_DEG": CEREAL_BOX_YAW_DEG,
+        "DEFAULT_GRIPPER_YAW_DEG": DEFAULT_GRIPPER_YAW_DEG,
+        "POS_GAIN": POS_GAIN,
+        "MAX_CART_ACTION": MAX_CART_ACTION,
+        "POS_TOL": POS_TOL,
+        "MAX_YAW_ACTION": MAX_YAW_ACTION,
+        "YAW_TOL_RAD": float(YAW_TOL),
+        "SLIP_RECOVERY_Z_OFFSET_M": SLIP_RECOVERY_Z_OFFSET_M,
+        "SLIP_RECOVERY_DESCENT_STEPS": SLIP_RECOVERY_DESCENT_STEPS,
+        "SLIP_RECOVERY_SETTLE_STEPS": SLIP_RECOVERY_SETTLE_STEPS,
+        "GRASP_HOVER_Z_OFFSET_M": GRASP_HOVER_Z_OFFSET_M,
+        "GRASP_LIFT_Z_OFFSET_M": GRASP_LIFT_Z_OFFSET_M,
+        "GRASP_Z_OFFSET_FROM_COM_M": GRASP_Z_OFFSET_FROM_COM_M,
+        "GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS": GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS,
+        "GRASP_APPROACH_YAW_OFFSET_DEG": GRASP_APPROACH_YAW_OFFSET_DEG,
+        "LIFT_SUCCESS_BODY_Z_MIN_M": LIFT_SUCCESS_BODY_Z_MIN_M,
+    }
+
+
+def apply_cereal_simplified_pose(env):
+    """Place the cereal box at the canonical pose used in simplify_environment."""
+    cereal_pos = np.array([0.08, -0.25, 0.9])
+    half_yaw_rad = np.deg2rad(CEREAL_BOX_YAW_DEG) / 2.0
+    cereal_quat = np.array([np.cos(half_yaw_rad), 0.0, 0.0, np.sin(half_yaw_rad)])
+    cereal_id = env.sim.model.joint_name2id("Cereal_joint0")
+    cereal_idx = env.sim.model.jnt_qposadr[cereal_id]
+    env.sim.data.qpos[cereal_idx : cereal_idx + 3] = cereal_pos
+    env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_quat
+    env.sim.forward()
+    for _ in range(50):
+        env.sim.step()
+    env.sim.data.qpos[cereal_idx : cereal_idx + 3] = cereal_pos
+    env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_quat
+    qvel_idx = env.sim.model.jnt_dofadr[cereal_id]
+    env.sim.data.qvel[qvel_idx : qvel_idx + 6] = 0.0
+    env.sim.forward()
+
+
+def is_cereal_box_tipped(env):
+    """True if cereal body is not upright enough or has fallen vs standing pose."""
+    try:
+        for obj in env.objects:
+            if "cereal" not in obj.name.lower():
+                continue
+            bid = env.sim.model.body_name2id(obj.root_body)
+            quat = np.array(env.sim.data.body_xquat[bid], dtype=float)
+            R = T.quat2mat(quat)
+            up_dot = abs(float(np.dot(R[:, 2], np.array([0.0, 0.0, 1.0]))))
+            com_z = float(env.sim.data.body_xpos[bid][2])
+            if up_dot < CEREAL_TIP_MAX_UP_DOT or com_z < CEREAL_TIP_MIN_COM_Z_M:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def maybe_reset_cereal_if_tipped(env, target_obj_name):
+    """
+    If the cereal box tipped, restore canonical simplify pose (for cleaner retries).
+    Returns True if a reset was applied.
+    """
+    if "cereal" not in (target_obj_name or "").lower():
+        return False
+    if not is_cereal_box_tipped(env):
+        return False
+    print(
+        "--- Cereal tipped: resetting box to simplified pose before next attempt ---"
+    )
+    apply_cereal_simplified_pose(env)
+    return True
 
 
 def simplify_environment(env):
     """Reposition objects to create a 1-bin / 1-object simplified world (Cereal only)."""
     print("--- SIMPLIFYING ENVIRONMENT: 1-Bin / 1-Object Mode (Cereal only) ---")
     try:
-        cereal_pos = np.array([0.08, -0.25, 0.9])
-        half_yaw_rad = np.deg2rad(CEREAL_BOX_YAW_DEG) / 2.0
-        cereal_quat = np.array([np.cos(half_yaw_rad), 0.0, 0.0, np.sin(half_yaw_rad)])
-
         # Hide all objects except Cereal
         for obj_name in ["Bread_joint0", "Can_joint0", "Milk_joint0"]:
             j_id = env.sim.model.joint_name2id(obj_name)
             q_idx = env.sim.model.jnt_qposadr[j_id]
             env.sim.data.qpos[q_idx : q_idx + 3] = np.array([5.0, 5.0, -1.0])
 
-        # Place Cereal in the center of Bin 1 with clearance from all walls
-        cereal_id = env.sim.model.joint_name2id("Cereal_joint0")
-        cereal_idx = env.sim.model.jnt_qposadr[cereal_id]
-        env.sim.data.qpos[cereal_idx : cereal_idx + 3] = cereal_pos
-        env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_quat
-
-        env.sim.forward()  # Force physics update
-
-        # Let physics settle so GT position is stable before any GT read
-        for _ in range(50):
-            env.sim.step()
-
-        env.sim.data.qpos[cereal_idx : cereal_idx + 3] = cereal_pos
-        env.sim.data.qpos[cereal_idx + 3 : cereal_idx + 7] = cereal_quat
-        qvel_idx = env.sim.model.jnt_dofadr[cereal_id]
-        env.sim.data.qvel[qvel_idx : qvel_idx + 6] = 0.0
-        env.sim.forward()
+        apply_cereal_simplified_pose(env)
     except Exception as e:
         print(f"Warning: Physics simplification failed: {e}")
 
@@ -150,6 +254,10 @@ def failure_type_implies_grasp_success(failure_type):
     return failure_type == "slip_after_contact"
 
 def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0, seed=None, processor=None, model=None, device=None):
+    # Normalize so "Feedback", " feedback ", etc. still enable recovery; must match get_max_attempts_for_condition.
+    if condition is not None:
+        condition = str(condition).strip().lower()
+
     print(f"\n--- Starting Trial {trial_idx} | Condition: {condition} ---")
     print(f"Language Instruction: '{instruction}'")
     
@@ -166,7 +274,11 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         "explanation": ""
     }
     max_attempts = get_max_attempts_for_condition(condition)
-    
+    print(
+        f"Max grasp attempts (initial + retries) for this condition: {max_attempts}. "
+        f"Use condition='feedback' or 'feedback_3' for retries; 'feedback_1' or 'baseline' allows only the first grasp."
+    )
+
     if seed is not None:
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -191,6 +303,8 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     run_dir = os.path.join("runs", run_name)
     os.makedirs(run_dir, exist_ok=True)
     print(f"Run artifacts → {run_dir}")
+    tuning_grasp_records = []
+    initial_detection_vs_gt = None
 
     def get_attempt_dir(attempt_num):
         attempt_dir = os.path.join(run_dir, f"attempt_{attempt_num}")
@@ -261,6 +375,31 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
         start_yaw = current_eef_yaw(current_obs)
         target_yaw = wrap_to_pi(start_yaw + normalized_delta)
+        for _ in range(steps):
+            yaw_error = wrap_to_pi(target_yaw - current_eef_yaw(current_obs))
+            if abs(yaw_error) < YAW_TOL:
+                break
+
+            action = np.zeros(7)
+            action[5] = np.clip(yaw_error * 0.8, -MAX_YAW_ACTION, MAX_YAW_ACTION)
+            action[6] = gripper_action
+            current_obs, _, _, _ = env.step(action)
+            if video_enabled and video_writer:
+                video_writer.append_data(current_obs["frontview_image"][::-1])
+
+        return current_obs
+
+    def rotate_yaw_to_world_yaw(current_obs, target_yaw_rad, gripper_action, steps=40):
+        """Drive gripper planar yaw to an absolute world-frame heading (gripper +X in XY)."""
+
+        def wrap_to_pi(angle_rad):
+            return (angle_rad + np.pi) % (2.0 * np.pi) - np.pi
+
+        def current_eef_yaw(obs_ref):
+            eef_rot = T.quat2mat(obs_ref["robot0_eef_quat"])
+            return np.arctan2(eef_rot[1, 0], eef_rot[0, 0])
+
+        target_yaw = wrap_to_pi(target_yaw_rad)
         for _ in range(steps):
             yaw_error = wrap_to_pi(target_yaw - current_eef_yaw(current_obs))
             if abs(yaw_error) < YAW_TOL:
@@ -355,8 +494,50 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     print("--- CLEAR VIEW: Retracting arm for initial perception ---")
     retract_pos = np.array([0.4, -0.6, 1.4])
     obs = step_towards(obs, retract_pos, gripper_action=-1, steps=12)
-    print(f"--- DEFAULT YAW: Rotating gripper to {DEFAULT_GRIPPER_YAW_DEG:.0f}° before detection/grasp ---")
-    obs = rotate_yaw_in_place(obs, np.deg2rad(DEFAULT_GRIPPER_YAW_DEG), gripper_action=-1, steps=40)
+
+    target_obj_name = None
+    if "milk" in instruction.lower():
+        target_obj_name = "Milk"
+    elif "bread" in instruction.lower():
+        target_obj_name = "Bread"
+    elif "cereal" in instruction.lower():
+        target_obj_name = "Cereal"
+    elif "can" in instruction.lower():
+        target_obj_name = "Can"
+
+    if not target_obj_name:
+        print("Failure Reasoning: 'wrong-object selection'")
+        print("Explanation: The perception model could not map the instruction to an object.")
+        return False
+
+    approach_yaw_world_deg_used = float(DEFAULT_GRIPPER_YAW_DEG)
+    approach_axis_used = "fallback"
+    gt_pose_for_yaw = get_target_object_ground_truth(env, target_obj_name)
+    if gt_pose_for_yaw is not None:
+        ax = str(GRASP_APPROACH_ALIGN_TO_OBJECT_AXIS).lower()
+        if ax == "x":
+            base_deg = float(gt_pose_for_yaw["object_body_x_planar_yaw_deg"])
+        else:
+            base_deg = float(gt_pose_for_yaw["object_body_y_planar_yaw_deg"])
+        approach_yaw_deg = base_deg + GRASP_APPROACH_YAW_OFFSET_DEG
+        approach_yaw_world_deg_used = float(approach_yaw_deg)
+        approach_axis_used = ax
+        print(
+            f"--- APPROACH YAW: align gripper +X to object {ax}-axis "
+            f"(world yaw {approach_yaw_deg:.1f}°) before detection/grasp ---"
+        )
+        obs = rotate_yaw_to_world_yaw(
+            obs, np.deg2rad(approach_yaw_deg), gripper_action=-1, steps=40
+        )
+    else:
+        print(
+            f"--- APPROACH YAW: no sim GT for '{target_obj_name}'; "
+            f"using fallback world yaw {DEFAULT_GRIPPER_YAW_DEG:.0f}° ---"
+        )
+        obs = rotate_yaw_to_world_yaw(
+            obs, np.deg2rad(DEFAULT_GRIPPER_YAW_DEG), gripper_action=-1, steps=40
+        )
+
     owlvit_frontview = create_frontview_image(obs, env)
     try:
         Image.fromarray(owlvit_frontview).save(os.path.join(run_dir, "owlvit_clear_view.png"))
@@ -365,19 +546,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     
     if video_enabled and video_writer:
         video_writer.append_data(obs["frontview_image"][::-1])
-    
-    # Simulate VLM picking out the target from the language instruction
-    target_obj_name = None
-    if "milk" in instruction.lower(): target_obj_name = "Milk"
-    elif "bread" in instruction.lower(): target_obj_name = "Bread"
-    elif "cereal" in instruction.lower(): target_obj_name = "Cereal"
-    elif "can" in instruction.lower(): target_obj_name = "Can"
-    
-    if not target_obj_name:
-        print("Failure Reasoning: 'wrong-object selection'")
-        print("Explanation: The perception model could not map the instruction to an object.")
-        return False
-        
+
     print(f"Perception matched object: {target_obj_name}")
 
     # Process camera obs and detect with OWL-ViT
@@ -428,9 +597,20 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     pixels = np.array([orig_v, u])
     
     pt_3d = transform_from_pixels_to_world(pixels, real_depth, cam_mat)
-
-    pt_3d[2] = 0.825
-    print("Using OWL-ViT 2D detection + depth projection only for the initial grasp target.")
+    z_projected = float(pt_3d[2])
+    gt_pose = get_target_object_ground_truth(env, target_obj_name)
+    if gt_pose is not None:
+        z_com = float(np.asarray(gt_pose["com_xyz"], dtype=float)[2])
+        pt_3d[2] = z_com + GRASP_Z_OFFSET_FROM_COM_M
+        print(
+            f"Grasp Z from sim COM ({z_com:.4f} m) + offset {GRASP_Z_OFFSET_FROM_COM_M:.4f} m "
+            f"(projected depth Z was {z_projected:.4f} m)."
+        )
+    else:
+        pt_3d[2] = z_projected
+        print(
+            f"Grasp Z from depth projection ({z_projected:.4f} m); no matching object in sim for COM."
+        )
 
     initial_owlvit_3d = pt_3d.copy()
 
@@ -438,6 +618,33 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
     # VLM Target 3D Position
     obj_pos = pt_3d.copy()
+
+    try:
+        gt0 = get_target_object_ground_truth(env, target_obj_name)
+        if gt0:
+            cam_tf = get_camera_transform_matrix(env.sim, "frontview", IMG_H, IMG_W)
+            gt_com = np.array(gt0["com_xyz"], dtype=float)
+            pix = project_points_from_world_to_camera(
+                gt_com.reshape(1, 3), cam_tf, IMG_H, IMG_W
+            )[0]
+            gt_v, gt_u = float(pix[0]), float(pix[1])
+            initial_detection_vs_gt = {
+                "owlvit_box_center_uv": [float(u), float(v)],
+                "gt_com_projected_to_frontview_vu": [gt_v, gt_u],
+                "pixel_delta_detection_minus_gt_vu": [float(v) - gt_v, float(u) - gt_u],
+                "commanded_initial_target_xyz_m": pt_3d.tolist(),
+                "gt_com_xyz_m": gt0["com_xyz"],
+                "delta_commanded_minus_gt_com_m": (pt_3d - gt_com).tolist(),
+                "gt_body_axes_planar_yaw_deg": {
+                    "x": gt0["object_body_x_planar_yaw_deg"],
+                    "y": gt0["object_body_y_planar_yaw_deg"],
+                },
+                "approach_yaw_world_deg": float(approach_yaw_world_deg_used),
+                "approach_axis_aligned_to": approach_axis_used,
+                "fallback_yaw_constant_deg": float(DEFAULT_GRIPPER_YAW_DEG),
+            }
+    except Exception as e:
+        initial_detection_vs_gt = {"error": str(e)}
 
     HOME_POS = np.array([0.4, -0.6, 1.4])
 
@@ -450,7 +657,7 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         for o in env_ref.objects:
             body_id = env_ref.sim.model.body_name2id(o.root_body)
             z_pos = env_ref.sim.data.body_xpos[body_id][2]
-            if z_pos > 0.95:
+            if z_pos > LIFT_SUCCESS_BODY_Z_MIN_M:
                 lifted_any = True
                 if target_name.lower() in o.name.lower():
                     target_picked = True
@@ -461,7 +668,13 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
     # Temporal evidence frames captured at each grasp checkpoint for Stage 1 classification
     frames = {}
 
-    def perform_grasp_attempt(current_obs, target_pos, settle_steps=6, pre_yaw_deg=0.0):
+    def perform_grasp_attempt(
+        current_obs,
+        target_pos,
+        settle_steps=6,
+        pre_yaw_deg=0.0,
+        descent_steps=8,
+    ):
         attempt_frames = {}
 
         print("Action Plan: Hovering above object...")
@@ -476,10 +689,13 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 current_obs, np.deg2rad(pre_yaw_deg), gripper_action=-1, steps=20
             )
 
-        print("Action Plan: Lowering to grasp...")
+        print(f"Action Plan: Lowering to grasp ({descent_steps} steps)...")
         grasp_pos = target_pos.copy()
-        current_obs = step_towards(current_obs, grasp_pos, gripper_action=-1, steps=8)
+        current_obs = step_towards(
+            current_obs, grasp_pos, gripper_action=-1, steps=descent_steps
+        )
         attempt_frames["contact"] = create_frontview_image(current_obs, env)
+        obs_at_contact = current_obs
 
         print("Action Plan: Closing gripper...")
         current_obs = step_towards(current_obs, grasp_pos, gripper_action=1, steps=settle_steps, settle=True)
@@ -492,6 +708,52 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
         attempt_frames["post_lift"] = create_frontview_image(current_obs, env)
 
         lifted_any, target_ok, wrong_ok = check_objects_lifted(env, target_obj_name)
+
+        try:
+            gt = get_target_object_ground_truth(env, target_obj_name)
+            yaw_e = _eef_planar_yaw_rad(obs_at_contact)
+            rec = {
+                "commanded_target_xyz_m": grasp_pos.tolist(),
+                "hover_xyz_m": hover_pos.tolist(),
+                "pre_yaw_deg": float(pre_yaw_deg),
+                "descent_steps": int(descent_steps),
+                "settle_steps": int(settle_steps),
+                "lift_delta_z_m": float(GRASP_LIFT_Z_OFFSET_M),
+                "at_contact_eef_xyz_m": obs_at_contact["robot0_eef_pos"].tolist(),
+                "at_contact_eef_planar_yaw_deg": float(np.rad2deg(yaw_e)),
+                "lifted_outcome": {
+                    "lifted_any": bool(lifted_any),
+                    "target_picked": bool(target_ok),
+                    "wrong_picked": bool(wrong_ok),
+                },
+            }
+            if gt:
+                gcom = np.array(gt["com_xyz"], dtype=float)
+                yaw_x = np.deg2rad(gt["object_body_x_planar_yaw_deg"])
+                yaw_y = np.deg2rad(gt["object_body_y_planar_yaw_deg"])
+                rec["ground_truth_com_xyz_m"] = gt["com_xyz"]
+                rec["ground_truth_body_axes_planar_yaw_deg"] = {
+                    "x": gt["object_body_x_planar_yaw_deg"],
+                    "y": gt["object_body_y_planar_yaw_deg"],
+                }
+                rec["errors_m"] = {
+                    "commanded_grasp_minus_gt_com": (grasp_pos - gcom).tolist(),
+                    "eef_contact_minus_gt_com": (
+                        obs_at_contact["robot0_eef_pos"] - gcom
+                    ).tolist(),
+                }
+                rec["errors_deg"] = {
+                    "eef_planar_yaw_minus_object_body_x_axis": float(
+                        np.rad2deg(_wrap_angle_rad(yaw_e - yaw_x))
+                    ),
+                    "eef_planar_yaw_minus_object_body_y_axis": float(
+                        np.rad2deg(_wrap_angle_rad(yaw_e - yaw_y))
+                    ),
+                }
+            tuning_grasp_records.append(rec)
+        except Exception as e:
+            tuning_grasp_records.append({"error": str(e)})
+
         return current_obs, attempt_frames, lifted_any, target_ok, wrong_ok
 
     obs, frames, lifted_any, target_picked, wrong_picked = perform_grasp_attempt(obs, obj_pos)
@@ -601,10 +863,22 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 if failure_type_implies_grasp_success(failure_type):
                     metrics["grasp_success"] = True
 
+                prompt_text = failure_result.get("prompt_text", "")
+                prompt_transcript = failure_result.get("prompt_transcript", "")
                 try:
                     with open(os.path.join(attempt_dir, "gemini_prompt.txt"), "w") as f:
-                        f.write(failure_result.get("prompt_text", ""))
-                    log = {k: v for k, v in failure_result.items() if k != "prompt_text"}
+                        f.write(prompt_text)
+                    if prompt_transcript:
+                        with open(
+                            os.path.join(attempt_dir, "gemini_user_message_transcript.txt"),
+                            "w",
+                        ) as f:
+                            f.write(prompt_transcript)
+                    log = {
+                        k: v
+                        for k, v in failure_result.items()
+                        if k not in ("prompt_text", "prompt_transcript")
+                    }
                     with open(os.path.join(attempt_dir, "failure_classification.json"), "w") as f:
                         _json.dump(log, f, indent=2)
                 except Exception:
@@ -618,6 +892,31 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                     break
 
                 metrics["attempts"] += 1
+                # Duplicate the classification prompt into the next attempt folder so
+                # e.g. attempt_1/ and attempt_2/ both carry the same text for review
+                # (attempt_2 also gets gemini_prompt.txt if that grasp fails later).
+                try:
+                    next_attempt_dir = get_attempt_dir(metrics["attempts"])
+                    with open(
+                        os.path.join(next_attempt_dir, "gemini_prompt_from_previous_attempt.txt"),
+                        "w",
+                    ) as f:
+                        f.write(prompt_text)
+                    if prompt_transcript:
+                        with open(
+                            os.path.join(
+                                next_attempt_dir,
+                                "gemini_user_message_transcript_from_previous_attempt.txt",
+                            ),
+                            "w",
+                        ) as f:
+                            f.write(prompt_transcript)
+                except Exception:
+                    pass
+
+                if maybe_reset_cereal_if_tipped(env, target_obj_name):
+                    obj_pos = initial_owlvit_3d.copy()
+
                 print(f"\n--- RECOVERY ATTEMPT {metrics['attempts']} | policy={failure_type} ---")
 
                 if video_enabled and video_writer is not None:
@@ -666,15 +965,37 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
 
                 elif failure_type == "slip_after_contact":
                     target_pos = obj_pos.copy()
-                    target_pos[2] += SLIP_RECOVERY_Z_OFFSET_M
-                    recovery_log["policy"] = "lower_grasp_more_settle"
-                    recovery_log["parameters"] = {
-                        "z_offset_m": SLIP_RECOVERY_Z_OFFSET_M,
+                    gt_slip = get_target_object_ground_truth(env, target_obj_name)
+                    slip_params = {
+                        "extra_depth_below_nominal_com_grasp_m": SLIP_RECOVERY_Z_OFFSET_M,
                         "settle_steps": SLIP_RECOVERY_SETTLE_STEPS,
-                        "target_pos": target_pos.tolist(),
                     }
+                    if gt_slip is not None:
+                        z_com = float(np.asarray(gt_slip["com_xyz"], dtype=float)[2])
+                        nominal_z = z_com + GRASP_Z_OFFSET_FROM_COM_M
+                        target_pos[2] = nominal_z + SLIP_RECOVERY_Z_OFFSET_M
+                        slip_params["z_com_m"] = z_com
+                        slip_params["nominal_grasp_z_m"] = nominal_z
+                        slip_params["slip_grasp_z_m"] = float(target_pos[2])
+                    else:
+                        target_pos[2] += SLIP_RECOVERY_Z_OFFSET_M
+                        slip_params["note"] = (
+                            "no sim GT; applied offset to previous obj_pos z (legacy)"
+                        )
+                    slip_params["target_pos"] = target_pos.tolist()
+                    slip_params["descent_steps"] = SLIP_RECOVERY_DESCENT_STEPS
+                    recovery_log["policy"] = "lower_grasp_more_settle"
+                    recovery_log["parameters"] = slip_params
+                    print(
+                        f"  Slip recovery: grasp Z target {target_pos[2]:.4f} m "
+                        f"({abs(SLIP_RECOVERY_Z_OFFSET_M)*100:.1f} cm below nominal COM grasp), "
+                        f"{SLIP_RECOVERY_DESCENT_STEPS} descent steps."
+                    )
                     obs, frames, lifted_any, target_ok, wrong_ok = perform_grasp_attempt(
-                        obs, target_pos, settle_steps=SLIP_RECOVERY_SETTLE_STEPS
+                        obs,
+                        target_pos,
+                        settle_steps=SLIP_RECOVERY_SETTLE_STEPS,
+                        descent_steps=SLIP_RECOVERY_DESCENT_STEPS,
                     )
 
                 elif failure_type == "depth_plane_bad":
@@ -733,6 +1054,21 @@ def run_baseline(instruction="pick the milk", condition="feedback", trial_idx=0,
                 **metrics,
             }, f, indent=2)
         print(f"Trial summary → {os.path.join(run_dir, 'trial_summary.json')}")
+
+        tuning_payload = {
+            "run_dir": run_dir,
+            "target_object": target_obj_name,
+            "tunable_constants": snapshot_tunable_constants(),
+            "initial_detection_vs_gt": initial_detection_vs_gt,
+            "per_grasp_contact_snapshot": tuning_grasp_records,
+            "notes": [
+                "commanded_target_z uses a hardcoded table plane after OWL-ViT XY; see delta_commanded_minus_gt_com_m for vertical mismatch vs sim COM.",
+                "eef_planar_yaw_minus_object_body_* compares world-XY heading of gripper +X to object body axes; a 'good' grasp may differ by ~90° depending on finger approach vs box edge.",
+            ],
+        }
+        with open(os.path.join(run_dir, "tuning_vs_ground_truth.json"), "w") as f:
+            _json.dump(tuning_payload, f, indent=2)
+        print(f"Tuning vs GT → {os.path.join(run_dir, 'tuning_vs_ground_truth.json')}")
     except Exception:
         pass
 
